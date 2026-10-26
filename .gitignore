@@ -1,0 +1,43 @@
+# ==========================================
+# 1. Python & Virtual Environment
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+ENV/
+.env/
+
+# ==========================================
+# 2. PyInstaller (Hasil Build)
+# ==========================================
+build/
+dist/
+*.spec
+
+# ==========================================
+# 3. ExifTool (Binary File)
+# ==========================================
+# Jangan upload file ExifTool ke GitHub karena ukurannya besar
+exiftool.exe
+exiftool_files/
+exiftool-*.zip
+
+# ==========================================
+# 4. Folder Test / Output
+# ==========================================
+# Jangan upload gambar dummy dan hasil test
+dummy-test/
+output/
+test/
+test_output/
+
+# ==========================================
+# 5. IDE & OS
+# ==========================================
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
