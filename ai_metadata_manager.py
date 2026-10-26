@@ -3,20 +3,33 @@
 AI Metadata Manager (Complete & Fixed)
 ======================================
 Batch metadata + rename + duplicate detection + drag & drop + dark mode
-+ optional upscale 4x untuk AI-generated stock images.
++ Validasi 4MP, Auto-Upscale 4x, Suara Notifikasi, dan Penyimpanan Config.
 """
 
 import os
 import re
 import csv
 import sys
+import json
 import shutil
 import hashlib
 import subprocess
 import threading
+import warnings
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox
+
+# ---------- Sound Notification (Bawaan Windows) ---------- #
+try:
+    import winsound
+    HAS_WINSOUND = True
+except ImportError:
+    HAS_WINSOUND = False
+
+# Menyembunyikan peringatan kuning dari ttkbootstrap
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 # ---------- Optional imports ---------- #
 try:
@@ -63,8 +76,56 @@ UPSCALER_MODELS = [
 
 
 # ============================================================ #
-#  ICON (auto-generate sekali)
+#  HELPERS
 # ============================================================ #
+def play_finish_sound(is_error=False):
+    if not HAS_WINSOUND:
+        return
+    
+    def _play():
+        try:
+            if is_error:
+                # --- SUARA ERROR: NADA SIBUK (BUSY SIGNAL) TELEPON ---
+                for _ in range(4):
+                    winsound.Beep(480, 200)
+                    time.sleep(0.2)
+            else:
+                # --- SUARA SUKSES: SIMULASI MODEM DIAL-UP ---
+                # 1. Nada Sambung (Dial Tone)
+                winsound.Beep(440, 600) 
+                time.sleep(0.2)
+                
+                # 2. Nada Menekan Nomor Telepon (DTMF)
+                winsound.Beep(941, 100); time.sleep(0.05)
+                winsound.Beep(697, 100); time.sleep(0.05)
+                winsound.Beep(852, 100); time.sleep(0.05)
+                winsound.Beep(770, 100); time.sleep(0.1)
+                
+                # 3. Handshake Modem (Suara melengking tinggi-rendah)
+                winsound.Beep(2100, 150); time.sleep(0.05)
+                winsound.Beep(1200, 100); time.sleep(0.05)
+                winsound.Beep(2225, 150); time.sleep(0.05)
+                
+                # 4. Suara "Kresek-kresek" Data
+                for _ in range(4):
+                    winsound.Beep(1500, 30)
+                    winsound.Beep(1800, 30)
+                    winsound.Beep(1100, 30)
+                    winsound.Beep(2400, 30)
+                    winsound.Beep(1300, 30)
+                
+                # 5. Sukses Terhubung ke Internet!
+                winsound.Beep(1000, 100)
+                winsound.Beep(1500, 100)
+                winsound.Beep(2000, 300)
+                
+        except Exception:
+            pass
+
+    # Jalankan suara di background thread agar aplikasi tidak freeze
+    threading.Thread(target=_play, daemon=True).start()
+
+
 def ensure_icon():
     icon_path = Path(__file__).with_name("icon.ico")
     if icon_path.exists():
@@ -84,9 +145,6 @@ def ensure_icon():
     return str(icon_path)
 
 
-# ============================================================ #
-#  HELPERS
-# ============================================================ #
 def format_text(stem, mode):
     if mode == "As-is":
         return stem
@@ -199,8 +257,8 @@ class App(BaseWindow):
 
         if HAS_TTKBOOTSTRAP:
             self.style = ttkb.Style()
-            self.style.theme_use("superhero")
-            self._current_theme = "superhero"
+            self.style.theme_use("darkly")
+            self._current_theme = "darkly"
         else:
             self._current_theme = "default"
 
@@ -218,8 +276,42 @@ class App(BaseWindow):
         self._processing = False
         self._total_files = 0
         self._last_results = []
+        
+        if getattr(sys, 'frozen', False):
+            self.app_dir = Path(sys.executable).parent
+        else:
+            self.app_dir = Path(__file__).parent
+        self.config_file = self.app_dir / "config.json"
 
         self._build_ui()
+        self._load_config() 
+
+    def _load_config(self):
+        if self.config_file.exists():
+            try:
+                with open(self.config_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                
+                self.input_var.set(data.get("input_folder", ""))
+                self.output_var.set(data.get("output_folder", ""))
+                
+                saved_upscaler = data.get("upscaler_path", "")
+                if saved_upscaler and Path(saved_upscaler).exists():
+                    self.upscaler_path_var.set(saved_upscaler)
+            except Exception as e:
+                print(f"Gagal memuat config: {e}")
+
+    def _save_config(self):
+        try:
+            data = {
+                "input_folder": self.input_var.get().strip(),
+                "output_folder": self.output_var.get().strip(),
+                "upscaler_path": self.upscaler_path_var.get().strip(),
+            }
+            with open(self.config_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=4)
+        except Exception as e:
+            print(f"Gagal menyimpan config: {e}")
 
     # -------------------- UI -------------------- #
     def _build_ui(self):
@@ -395,7 +487,55 @@ class App(BaseWindow):
         f.columnconfigure(0, weight=1)
         row = 0
 
-        box1 = ttkb.LabelFrame(f, text="Adobe Stock", padding=10)
+        box_res = ttkb.LabelFrame(f, text="Validasi & Kualitas (Adobe Stock)", padding=10)
+        box_res.grid(row=row, column=0, sticky="ew", pady=(0, 10))
+        box_res.columnconfigure(0, weight=1)
+
+        self.validate_mp_var = tk.BooleanVar(value=True)
+        ttkb.Checkbutton(box_res, 
+                         text="Validasi minimal 4 Megapiksel (Standar Adobe Stock)",
+                         variable=self.validate_mp_var).grid(row=0, column=0, sticky="w", pady=2)
+
+        # DIUBAH MENJADI TRUE SECARA DEFAULT
+        self.auto_upscale_small_var = tk.BooleanVar(value=True)
+        ttkb.Checkbutton(box_res, 
+                         text="Auto-Upscale 4x JIKA resolusi di bawah 4 MP",
+                         variable=self.auto_upscale_small_var).grid(row=1, column=0, sticky="w", pady=2)
+
+        row += 1
+        box4 = ttkb.LabelFrame(f,
+                               text="Manual Upscale (Real-ESRGAN / Upscayl)",
+                               padding=10)
+        box4.grid(row=row, column=0, sticky="ew", pady=(0, 10))
+        box4.columnconfigure(1, weight=1)
+
+        self.upscale_var = tk.BooleanVar(value=False)
+        ttkb.Checkbutton(box4,
+                         text="Paksa Upscale SEMUA gambar 4x setelah proses",
+                         variable=self.upscale_var).grid(
+            row=0, column=0, columnspan=3, sticky="w", pady=2)
+
+        ttkb.Label(box4, text="Upscaler exe:").grid(row=1, column=0,
+                                                     sticky="w", pady=2)
+        self.upscaler_path_var = tk.StringVar(value="")
+        ttkb.Entry(box4, textvariable=self.upscaler_path_var).grid(
+            row=1, column=1, sticky="ew", padx=6)
+        ttkb.Button(box4, text="Browse…", command=self._pick_upscaler,
+                    width=10).grid(row=1, column=2)
+
+        ttkb.Label(box4, text="Model:").grid(row=2, column=0,
+                                              sticky="w", pady=2)
+        self.upscale_model_var = tk.StringVar(value=UPSCALER_MODELS[0])
+        ttkb.Combobox(box4, textvariable=self.upscale_model_var,
+                      state="readonly",
+                      values=UPSCALER_MODELS, width=30).grid(
+            row=2, column=1, sticky="w", padx=6)
+
+        ttkb.Label(box4, text="Pastikan file realesrgan-ncnn-vulkan.exe dan folder 'models' berada di satu folder.",
+                   foreground="#888").grid(row=3, column=0, columnspan=3, sticky="w", pady=4)
+
+        row += 1
+        box1 = ttkb.LabelFrame(f, text="Metadata Tambahan", padding=10)
         box1.grid(row=row, column=0, sticky="ew", pady=(0, 10))
         box1.columnconfigure(1, weight=1)
 
@@ -415,6 +555,23 @@ class App(BaseWindow):
         ttkb.Label(box1, text="(kosongkan = sama dengan Title)",
                    foreground="#888").grid(row=2, column=1,
                                             sticky="w", padx=6)
+        
+        row += 1
+        box_sec = ttkb.LabelFrame(f, text="Keamanan", padding=10)
+        box_sec.grid(row=row, column=0, sticky="ew", pady=(0, 10))
+        box_sec.columnconfigure(0, weight=1)
+
+        self.dup_check_var = tk.BooleanVar(value=True)
+        ttkb.Checkbutton(box_sec,
+                         text="Deteksi duplikat (skip file dengan hash sama)",
+                         variable=self.dup_check_var).grid(
+            row=0, column=0, sticky="w", pady=2)
+
+        self.backup_var = tk.BooleanVar(value=False)
+        ttkb.Checkbutton(box_sec,
+                         text="Buat backup _original (mode in-place)",
+                         variable=self.backup_var).grid(
+            row=1, column=0, sticky="w", pady=2)
 
         row += 1
         box2 = ttkb.LabelFrame(f, text="Batch Rename", padding=10)
@@ -447,63 +604,10 @@ class App(BaseWindow):
                                     sticky="w", padx=6)
 
         row += 1
-        box3 = ttkb.LabelFrame(f, text="Keamanan", padding=10)
-        box3.grid(row=row, column=0, sticky="ew", pady=(0, 10))
-        box3.columnconfigure(0, weight=1)
-
-        self.dup_check_var = tk.BooleanVar(value=True)
-        ttkb.Checkbutton(box3,
-                         text="Deteksi duplikat (skip file dengan hash sama)",
-                         variable=self.dup_check_var).grid(
-            row=0, column=0, sticky="w", pady=2)
-
-        self.backup_var = tk.BooleanVar(value=False)
-        ttkb.Checkbutton(box3,
-                         text="Buat backup _original (mode in-place)",
-                         variable=self.backup_var).grid(
-            row=1, column=0, sticky="w", pady=2)
-
-        row += 1
-        box4 = ttkb.LabelFrame(f,
-                               text="Upscale (Real-ESRGAN / Upscayl)",
-                               padding=10)
-        box4.grid(row=row, column=0, sticky="ew", pady=(0, 10))
-        box4.columnconfigure(1, weight=1)
-
-        self.upscale_var = tk.BooleanVar(value=False)
-        ttkb.Checkbutton(box4,
-                         text="Upscale 4x setelah proses "
-                              "(butuh realesrgan-ncnn-vulkan / upscayl-bin)",
-                         variable=self.upscale_var).grid(
-            row=0, column=0, columnspan=3, sticky="w", pady=2)
-
-        ttkb.Label(box4, text="Upscaler exe:").grid(row=1, column=0,
-                                                     sticky="w", pady=2)
-        self.upscaler_path_var = tk.StringVar(value="")
-        ttkb.Entry(box4, textvariable=self.upscaler_path_var).grid(
-            row=1, column=1, sticky="ew", padx=6)
-        ttkb.Button(box4, text="Browse…", command=self._pick_upscaler,
-                    width=10).grid(row=1, column=2)
-
-        ttkb.Label(box4, text="Model:").grid(row=2, column=0,
-                                              sticky="w", pady=2)
-        self.upscale_model_var = tk.StringVar(value=UPSCALER_MODELS[0])
-        ttkb.Combobox(box4, textvariable=self.upscale_model_var,
-                      state="readonly",
-                      values=UPSCALER_MODELS, width=30).grid(
-            row=2, column=1, sticky="w", padx=6)
-
-        detected = find_upscaler()
-        info = f"Detected: {detected}" if detected else \
-               "Belum terdeteksi — Browse manual."
-        ttkb.Label(box4, text=info, foreground="#888").grid(
-            row=3, column=0, columnspan=3, sticky="w", pady=4)
-
-        row += 1
         ttkb.Label(f, text="Log:", font=("Segoe UI", 10, "bold")).grid(
             row=row, column=0, sticky="w")
         row += 1
-        self.log_text = tk.Text(f, height=12, wrap="word",
+        self.log_text = tk.Text(f, height=10, wrap="word",
                                  font=("Consolas", 9),
                                  bg="#1e1e1e", fg="#d4d4d4",
                                  insertbackground="white")
@@ -514,28 +618,31 @@ class App(BaseWindow):
     def _toggle_theme(self):
         if not HAS_TTKBOOTSTRAP:
             return
-        if self._current_theme == "superhero":
+        if self._current_theme == "darkly":
             self.style.theme_use("cosmo")
             self._current_theme = "cosmo"
         else:
-            self.style.theme_use("superhero")
-            self._current_theme = "superhero"
+            self.style.theme_use("darkly")
+            self._current_theme = "darkly"
 
     def _swap_folders(self):
         a = self.input_var.get()
         b = self.output_var.get()
         self.input_var.set(b)
         self.output_var.set(a)
+        self._save_config()
 
     def _pick_input(self):
         d = filedialog.askdirectory(title="Pilih folder input")
         if d:
             self.input_var.set(d)
+            self._save_config()
 
     def _pick_output(self):
         d = filedialog.askdirectory(title="Pilih folder output")
         if d:
             self.output_var.set(d)
+            self._save_config()
 
     def _pick_upscaler(self):
         p = filedialog.askopenfilename(
@@ -543,6 +650,7 @@ class App(BaseWindow):
             filetypes=[("Executable", "*.exe"), ("All files", "*.*")])
         if p:
             self.upscaler_path_var.set(p)
+            self._save_config() 
 
     def _parse_drop_paths(self, data):
         matches = re.findall(r'\{([^}]+)\}|(\S+)', data)
@@ -557,6 +665,7 @@ class App(BaseWindow):
             self.input_var.set(p)
         elif os.path.isfile(p):
             self.input_var.set(os.path.dirname(p))
+        self._save_config()
 
     def _on_drop_output(self, event):
         paths = self._parse_drop_paths(event.data)
@@ -567,6 +676,7 @@ class App(BaseWindow):
             self.output_var.set(p)
         elif os.path.isfile(p):
             self.output_var.set(os.path.dirname(p))
+        self._save_config()
 
     def _log(self, msg):
         def _append():
@@ -580,7 +690,9 @@ class App(BaseWindow):
         self.progress_label.config(
             text=f"{value} / {self._total_files} ({pct}%)")
 
-    # -------------------- Keywords helper -------------------- #
+    def _update_status(self, msg):
+        self.progress_label.config(text=msg)
+
     def _collect_keywords(self):
         kw = (["AI", "AI Generated"] if self.ai_tag_var.get() else []) \
              + split_keywords(self.extra_kw_var.get())
@@ -591,7 +703,6 @@ class App(BaseWindow):
                 out.append(k)
         return out
 
-    # -------------------- Preview -------------------- #
     def _preview(self):
         input_dir = self.input_var.get().strip()
         if not os.path.isdir(input_dir):
@@ -627,10 +738,11 @@ class App(BaseWindow):
         txt.insert("end", f"KEYWORDS:\n{values[2]}\n")
         txt.config(state="disabled")
 
-    # -------------------- Start -------------------- #
     def _start(self):
         if self._processing:
             return
+        self._save_config() 
+
         ok, err_msg = check_exiftool()
         if not ok:
             messagebox.showerror("ExifTool tidak siap", err_msg)
@@ -656,12 +768,13 @@ class App(BaseWindow):
                     "Error", f"Tidak bisa membuat output folder:\n{e}")
                 return
 
-        if self.upscale_var.get():
+        if self.upscale_var.get() or self.auto_upscale_small_var.get():
             upscaler = self.upscaler_path_var.get().strip() or find_upscaler()
             if not upscaler:
                 messagebox.showerror(
                     "Upscaler tidak ditemukan",
-                    "Pilih path upscaler exe di Advanced tab.\n\n"
+                    "Kamu mengaktifkan fitur Upscale, tapi path upscaler belum diatur.\n"
+                    "Pilih path upscaler exe di tab Advanced.\n\n"
                     "Download Real-ESRGAN:\n"
                     "https://github.com/xinntao/Real-ESRGAN/releases")
                 return
@@ -683,7 +796,6 @@ class App(BaseWindow):
         threading.Thread(target=self._worker, args=(files,),
                          daemon=True).start()
 
-    # -------------------- Upscale -------------------- #
     def _upscale_image(self, src, dst, scale, model):
         upscaler = self.upscaler_path_var.get().strip() or find_upscaler()
         if not upscaler:
@@ -699,20 +811,22 @@ class App(BaseWindow):
             flags = (subprocess.CREATE_NO_WINDOW
                      if sys.platform == "win32" else 0)
             r = subprocess.run(cmd, capture_output=True, text=True,
-                              timeout=1200, creationflags=flags)
+                              timeout=120, creationflags=flags)
             if r.returncode != 0:
-                self._log(f"✗ Upscale {Path(src).name}: "
-                          f"{r.stderr.strip()[:200]}")
+                self._log(f"✗ Upscale error: {Path(src).name}")
+                self._log(f"  Alasan: {r.stderr.strip()[:200]}")
                 return False
-            return Path(dst).exists()
+            if not Path(dst).exists():
+                self._log(f"✗ Upscale gagal: File output tidak terbuat.")
+                return False
+            return True
         except subprocess.TimeoutExpired:
-            self._log(f"✗ Upscale timeout: {Path(src).name}")
+            self._log(f"✗ Upscale timeout (lebih dari 2 menit): {Path(src).name}")
             return False
         except Exception as e:
             self._log(f"✗ Upscale error: {e}")
             return False
 
-    # -------------------- Worker -------------------- #
     def _worker(self, files):
         author = self.author_var.get().strip() or "AI Generated"
         title_fmt = self.title_fmt_var.get()
@@ -729,9 +843,12 @@ class App(BaseWindow):
         in_dir = Path(self.input_var.get())
         out_dir = (Path(self.output_var.get())
                    if mode != "inplace" else None)
-        do_backup = self.backup_var.get() and mode == "inplace"
+        
         do_dup = self.dup_check_var.get()
-        do_upscale = self.upscale_var.get()
+        do_upscale_force = self.upscale_var.get()
+        do_upscale_auto = self.auto_upscale_small_var.get()
+        do_validate_mp = self.validate_mp_var.get()
+        
         upscale_model = self.upscale_model_var.get()
         do_rename = self.rename_enable_var.get()
         rename_pattern = self.rename_pattern_var.get().strip()
@@ -761,10 +878,12 @@ class App(BaseWindow):
 
         for i, f in enumerate(files, 1):
             try:
+                self.after(0, self._update_status, f"Memproses ({i}/{len(files)}): {f.name[:30]}...")
+
                 if do_dup:
                     h = file_hash(f)
                     if h in seen_hashes:
-                        self._log(f"⏭ SKIP duplikat: {f.name}")
+                        self._log(f"⏭ SKIP duplikat: {f.name[:30]}...")
                         self.after(0, self._set_progress, i)
                         continue
                     seen_hashes[h] = f.name
@@ -783,7 +902,6 @@ class App(BaseWindow):
                     elif mode == "move":
                         shutil.move(f, target)
 
-                # FIX EXTENSION
                 real_ext = None
                 try:
                     with open(target, "rb") as fp:
@@ -802,47 +920,65 @@ class App(BaseWindow):
                     if new_target.exists():
                         new_target.unlink()
                     target.rename(new_target)
-                    self._log(f"🔄 Fix Ekstensi: {target.name} → {new_target.name}")
+                    self._log(f"🔄 Fix Ekstensi: {target.name[:30]}... → {new_target.name[:30]}...")
                     target = new_target
 
-                if do_backup:
-                    bak = target.with_suffix(
-                        target.suffix + "_original")
-                    if not bak.exists():
-                        shutil.copy2(target, bak)
+                original_stem = target.stem
+                title = format_text(original_stem, title_fmt)
+                desc_text = re.sub(r"[_\-]+", " ", original_stem)
+                description = re.sub(r"\s+", " ", desc_text).strip()
+                alt = alt_text or title
 
-                if do_upscale:
-                    upscaled = target.with_name(
-                        f"{target.stem}_upsc{target.suffix}")
-                    if self._upscale_image(target, upscaled, 4,
-                                            upscale_model):
+                if do_rename:
+                    new_path = target
+                    for _guard in range(10000):
+                        if "{" in rename_pattern:
+                            new_name = rename_pattern.format(num=next_num)
+                        else:
+                            new_name = f"{rename_pattern}_{next_num}"
+                        new_path = target.parent / (new_name + target.suffix)
+                        if not new_path.exists() or new_path == target:
+                            break
+                        next_num += 1
+                    if new_path != target:
+                        old_name = target.name
+                        target.rename(new_path)
+                        self._log(f"📝 Rename: {old_name[:30]}... → {new_path.name}")
+                        target = new_path
+                    next_num += 1
+
+                need_upscale = do_upscale_force
+                if HAS_PIL:
+                    try:
+                        with Image.open(target) as img:
+                            w, h = img.size
+                            mp = (w * h) / 1_000_000
+                            self._log(f"ℹ {target.name}: {w}x{h} ({mp:.1f} MP)")
+                            
+                            if do_validate_mp and mp < 4.0:
+                                self._log(f"⚠ Peringatan: {target.name} di bawah 4MP (Adobe Stock minimal 4MP).")
+                                if do_upscale_auto:
+                                    self._log("  ↳ Mengaktifkan Auto-Upscale karena resolusi kurang...")
+                                    need_upscale = True
+                    except Exception as e:
+                        self._log(f"⚠ Gagal cek resolusi: {e}")
+
+                if need_upscale:
+                    self.after(0, self._update_status, f"Upscaling 4x: {target.name}...")
+                    upscaled = target.with_name(f"{target.stem}_upsc{target.suffix}")
+                    if self._upscale_image(target, upscaled, 4, upscale_model):
                         try:
                             target.unlink()
                             upscaled.rename(target)
-                            self._log(f"⬆ Upscaled: {target.name}")
+                            self._log(f"⬆ Upscaled berhasil: {target.name}")
                         except Exception as e:
                             self._log(f"⚠ Gagal replace upscaled: {e}")
-
-                # METADATA VIA EXIFTOOL
-                title = format_text(target.stem, title_fmt)
-                
-                # Format deskripsi: ganti _ dan - menjadi spasi, rapikan spasi ganda
-                desc_text = re.sub(r"[_\-]+", " ", target.stem)
-                description = re.sub(r"\s+", " ", desc_text).strip()
-                
-                alt = alt_text or title
 
                 exe = get_exiftool_path()
                 cmd = [exe, "-charset", "utf8",
                        "-overwrite_original", "-m", "-sep", ", "]
                 
-                # HAPUS DULU semua tag keyword lama untuk mencegah duplikasi
-                cmd += [
-                    "-Keywords=", 
-                    "-Subject=", 
-                    "-IPTC:Keywords=", 
-                    "-XMP-dc:Subject="
-                ]
+                cmd += ["-Keywords=", "-Subject=", "-IPTC:Keywords=", "-XMP-dc:Subject="]
                 
                 cmd += [
                     f"-Title={title}",
@@ -858,7 +994,6 @@ class App(BaseWindow):
                 ]
                 
                 if kw_str:
-                    # HANYA tulis ke XMP-dc:Subject untuk mencegah ImStocker membaca ganda
                     cmd.append(f"-XMP-dc:Subject={kw_str}")
                     
                 if cat_num:
@@ -873,27 +1008,6 @@ class App(BaseWindow):
                     raise RuntimeError(
                         (r.stderr or r.stdout).strip())
 
-                if do_rename:
-                    new_path = target
-                    for _guard in range(10000):
-                        if "{" in rename_pattern:
-                            new_name = rename_pattern.format(
-                                num=next_num)
-                        else:
-                            new_name = f"{rename_pattern}_{next_num}"
-                        new_path = target.parent / \
-                                   (new_name + target.suffix)
-                        if not new_path.exists() or \
-                                new_path == target:
-                            break
-                        next_num += 1
-                    if new_path != target:
-                        old_name = target.name
-                        target.rename(new_path)
-                        self._log(f"📝 {old_name} → {new_path.name}")
-                        target = new_path
-                    next_num += 1
-
                 success += 1
                 results.append({
                     "filename": target.name,
@@ -907,29 +1021,31 @@ class App(BaseWindow):
                 })
 
             except Exception as e:
-                errors.append(f"{f.name}: {e}")
-                self._log(f"✗ {f.name}: {e}")
+                errors.append(f"{f.name[:30]}: {e}")
+                self._log(f"✗ {f.name[:30]}: {e}")
 
             self.after(0, self._set_progress, i)
 
         self._last_results = results
         self.after(0, self._on_done, success, errors)
 
-    # -------------------- Done -------------------- #
     def _on_done(self, success, errors):
         self._processing = False
         self.process_btn.config(state="normal")
+        self.progress_label.config(text="Selesai.")
         self._log(f"✔ Selesai. Sukses={success}, Error={len(errors)}")
+        
         if errors:
+            play_finish_sound(is_error=True)
             messagebox.showwarning(
                 "Selesai dengan error",
                 f"Sukses: {success}\nGagal: {len(errors)}\n\n"
                 f"5 error pertama:\n" + "\n".join(errors[:5]))
         else:
+            play_finish_sound(is_error=False)
             messagebox.showinfo(
                 "Selesai", f"Berhasil memproses {success} file.")
 
-    # -------------------- CSV -------------------- #
     def _export_csv(self):
         if not self._last_results:
             messagebox.showinfo(
