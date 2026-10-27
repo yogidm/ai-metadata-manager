@@ -2,8 +2,8 @@
 """
 AI Metadata Manager (Complete & Fixed)
 ======================================
-Batch metadata + rename + duplicate detection + drag & drop + dark mode
-+ Validasi 4MP, Auto-Upscale 4x, Suara Notifikasi, dan Penyimpanan Config.
+Batch metadata + rename + duplicate detection (SQLite DB) + drag & drop + dark mode
++ Validasi 4MP, Auto-Upscale (2x/3x/4x), Suara Notifikasi, Simpan Config, & Auto-Convert JPEG.
 """
 
 import os
@@ -13,6 +13,7 @@ import sys
 import json
 import shutil
 import hashlib
+import sqlite3
 import subprocess
 import threading
 import warnings
@@ -85,44 +86,31 @@ def play_finish_sound(is_error=False):
     def _play():
         try:
             if is_error:
-                # --- SUARA ERROR: NADA SIBUK (BUSY SIGNAL) TELEPON ---
                 for _ in range(4):
                     winsound.Beep(480, 200)
                     time.sleep(0.2)
             else:
-                # --- SUARA SUKSES: SIMULASI MODEM DIAL-UP ---
-                # 1. Nada Sambung (Dial Tone)
                 winsound.Beep(440, 600) 
                 time.sleep(0.2)
-                
-                # 2. Nada Menekan Nomor Telepon (DTMF)
                 winsound.Beep(941, 100); time.sleep(0.05)
                 winsound.Beep(697, 100); time.sleep(0.05)
                 winsound.Beep(852, 100); time.sleep(0.05)
                 winsound.Beep(770, 100); time.sleep(0.1)
-                
-                # 3. Handshake Modem (Suara melengking tinggi-rendah)
                 winsound.Beep(2100, 150); time.sleep(0.05)
                 winsound.Beep(1200, 100); time.sleep(0.05)
                 winsound.Beep(2225, 150); time.sleep(0.05)
-                
-                # 4. Suara "Kresek-kresek" Data
                 for _ in range(4):
                     winsound.Beep(1500, 30)
                     winsound.Beep(1800, 30)
                     winsound.Beep(1100, 30)
                     winsound.Beep(2400, 30)
                     winsound.Beep(1300, 30)
-                
-                # 5. Sukses Terhubung ke Internet!
                 winsound.Beep(1000, 100)
                 winsound.Beep(1500, 100)
                 winsound.Beep(2000, 300)
-                
         except Exception:
             pass
 
-    # Jalankan suara di background thread agar aplikasi tidak freeze
     threading.Thread(target=_play, daemon=True).start()
 
 
@@ -263,8 +251,8 @@ class App(BaseWindow):
             self._current_theme = "default"
 
         self.title(APP_NAME)
-        self.geometry("1080x880")
-        self.minsize(960, 720)
+        self.geometry("1080x920") 
+        self.minsize(960, 760)
 
         icon = ensure_icon()
         if icon:
@@ -282,9 +270,32 @@ class App(BaseWindow):
         else:
             self.app_dir = Path(__file__).parent
         self.config_file = self.app_dir / "config.json"
+        self.db_file = self.app_dir / "riwayat_proses.db"
 
+        self._init_db()
         self._build_ui()
         self._load_config() 
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _init_db(self):
+        """Membuat tabel SQLite jika belum ada."""
+        try:
+            with sqlite3.connect(self.db_file) as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS history (
+                        original_filename TEXT PRIMARY KEY,
+                        output_filename TEXT,
+                        processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                conn.commit()
+        except Exception as e:
+            print(f"Gagal inisialisasi DB: {e}")
+
+    def _on_close(self):
+        self._save_config()
+        self.destroy()
 
     def _load_config(self):
         if self.config_file.exists():
@@ -311,7 +322,7 @@ class App(BaseWindow):
             with open(self.config_file, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=4)
         except Exception as e:
-            print(f"Gagal menyimpan config: {e}")
+            self._log(f"⚠ Gagal menyimpan config: {e}")
 
     # -------------------- UI -------------------- #
     def _build_ui(self):
@@ -401,7 +412,7 @@ class App(BaseWindow):
         row += 1
         ttkb.Label(f, text="Author / Creator:").grid(row=row, column=0,
                                                       sticky="w", pady=4)
-        self.author_var = tk.StringVar(value="AI Generated")
+        self.author_var = tk.StringVar(value="demhndAIStock")
         ttkb.Entry(f, textvariable=self.author_var).grid(
             row=row, column=1, sticky="ew", padx=6, columnspan=2)
 
@@ -496,11 +507,15 @@ class App(BaseWindow):
                          text="Validasi minimal 4 Megapiksel (Standar Adobe Stock)",
                          variable=self.validate_mp_var).grid(row=0, column=0, sticky="w", pady=2)
 
-        # DIUBAH MENJADI TRUE SECARA DEFAULT
         self.auto_upscale_small_var = tk.BooleanVar(value=True)
         ttkb.Checkbutton(box_res, 
-                         text="Auto-Upscale 4x JIKA resolusi di bawah 4 MP",
+                         text="Auto-Upscale JIKA resolusi di bawah 4 MP",
                          variable=self.auto_upscale_small_var).grid(row=1, column=0, sticky="w", pady=2)
+
+        self.convert_jpeg_var = tk.BooleanVar(value=True)
+        ttkb.Checkbutton(box_res, 
+                         text="Konversi ke JPEG (Wajib untuk Adobe Stock Ilustrasi)",
+                         variable=self.convert_jpeg_var).grid(row=2, column=0, sticky="w", pady=2)
 
         row += 1
         box4 = ttkb.LabelFrame(f,
@@ -511,7 +526,7 @@ class App(BaseWindow):
 
         self.upscale_var = tk.BooleanVar(value=False)
         ttkb.Checkbutton(box4,
-                         text="Paksa Upscale SEMUA gambar 4x setelah proses",
+                         text="Paksa Upscale SEMUA gambar setelah proses",
                          variable=self.upscale_var).grid(
             row=0, column=0, columnspan=3, sticky="w", pady=2)
 
@@ -531,8 +546,15 @@ class App(BaseWindow):
                       values=UPSCALER_MODELS, width=30).grid(
             row=2, column=1, sticky="w", padx=6)
 
-        ttkb.Label(box4, text="Pastikan file realesrgan-ncnn-vulkan.exe dan folder 'models' berada di satu folder.",
-                   foreground="#888").grid(row=3, column=0, columnspan=3, sticky="w", pady=4)
+        ttkb.Label(box4, text="Scale:").grid(row=3, column=0,
+                                              sticky="w", pady=2)
+        self.upscale_scale_var = tk.StringVar(value="4x")
+        ttkb.Combobox(box4, textvariable=self.upscale_scale_var,
+                      state="readonly",
+                      values=["2x", "3x", "4x"], width=10).grid(
+            row=3, column=1, sticky="w", padx=6)
+        ttkb.Label(box4, text="(Trik: AI memproses 4x, lalu dikecilkan ke 2x/3x)",
+                   foreground="#888").grid(row=4, column=0, columnspan=3, sticky="w", pady=4)
 
         row += 1
         box1 = ttkb.LabelFrame(f, text="Metadata Tambahan", padding=10)
@@ -557,21 +579,26 @@ class App(BaseWindow):
                                             sticky="w", padx=6)
         
         row += 1
-        box_sec = ttkb.LabelFrame(f, text="Keamanan", padding=10)
+        box_sec = ttkb.LabelFrame(f, text="Keamanan & Database", padding=10)
         box_sec.grid(row=row, column=0, sticky="ew", pady=(0, 10))
         box_sec.columnconfigure(0, weight=1)
 
         self.dup_check_var = tk.BooleanVar(value=True)
         ttkb.Checkbutton(box_sec,
-                         text="Deteksi duplikat (skip file dengan hash sama)",
+                         text="Deteksi duplikat (Cek Database Riwayat)",
                          variable=self.dup_check_var).grid(
             row=0, column=0, sticky="w", pady=2)
+
+        ttkb.Button(box_sec, text="🗑️ Reset Database Riwayat",
+                    command=self._reset_db,
+                    bootstyle="danger-outline").grid(
+            row=1, column=0, sticky="w", pady=6)
 
         self.backup_var = tk.BooleanVar(value=False)
         ttkb.Checkbutton(box_sec,
                          text="Buat backup _original (mode in-place)",
                          variable=self.backup_var).grid(
-            row=1, column=0, sticky="w", pady=2)
+            row=2, column=0, sticky="w", pady=2)
 
         row += 1
         box2 = ttkb.LabelFrame(f, text="Batch Rename", padding=10)
@@ -613,6 +640,15 @@ class App(BaseWindow):
                                  insertbackground="white")
         self.log_text.grid(row=row, column=0, sticky="nsew", pady=4)
         f.rowconfigure(row, weight=1)
+
+    def _reset_db(self):
+        if messagebox.askyesno("Konfirmasi", "Hapus semua riwayat di database?\nAplikasi akan memproses ulang semua file dari awal."):
+            try:
+                with sqlite3.connect(self.db_file) as conn:
+                    conn.execute("DELETE FROM history")
+                self._log("🗑️ Database riwayat berhasil di-reset.")
+            except Exception as e:
+                self._log(f"⚠ Gagal reset DB: {e}")
 
     # -------------------- Actions -------------------- #
     def _toggle_theme(self):
@@ -800,13 +836,16 @@ class App(BaseWindow):
         upscaler = self.upscaler_path_var.get().strip() or find_upscaler()
         if not upscaler:
             return False
+        
         exe_name = Path(upscaler).name.lower()
+        
         if "upscayl" in exe_name:
             cmd = [upscaler, "-i", str(src), "-o", str(dst),
-                   "-s", str(scale), "-m", model]
+                   "-s", "4", "-m", model]
         else:
             cmd = [upscaler, "-i", str(src), "-o", str(dst),
-                   "-s", str(scale), "-n", model]
+                   "-s", "4", "-n", model]
+        
         try:
             flags = (subprocess.CREATE_NO_WINDOW
                      if sys.platform == "win32" else 0)
@@ -819,9 +858,22 @@ class App(BaseWindow):
             if not Path(dst).exists():
                 self._log(f"✗ Upscale gagal: File output tidak terbuat.")
                 return False
+                
+            if scale < 4 and HAS_PIL:
+                try:
+                    with Image.open(dst) as img:
+                        w, h = img.size
+                        new_w = int(w * (scale / 4))
+                        new_h = int(h * (scale / 4))
+                        resized = img.resize((new_w, new_h), Image.LANCZOS)
+                        resized.save(dst)
+                except Exception as e:
+                    self._log(f"⚠ Gagal resize ke {scale}x: {e}")
+            
             return True
+            
         except subprocess.TimeoutExpired:
-            self._log(f"✗ Upscale timeout (lebih dari 2 menit): {Path(src).name}")
+            self._log(f"✗ Upscale timeout: {Path(src).name}")
             return False
         except Exception as e:
             self._log(f"✗ Upscale error: {e}")
@@ -848,23 +900,28 @@ class App(BaseWindow):
         do_upscale_force = self.upscale_var.get()
         do_upscale_auto = self.auto_upscale_small_var.get()
         do_validate_mp = self.validate_mp_var.get()
+        do_convert_jpeg = self.convert_jpeg_var.get()
         
         upscale_model = self.upscale_model_var.get()
+        upscale_scale = int(self.upscale_scale_var.get().replace("x", ""))
+        
         do_rename = self.rename_enable_var.get()
         rename_pattern = self.rename_pattern_var.get().strip()
         start_num = self.start_num_var.get()
 
-        seen_hashes = {}
-        if do_dup and out_dir and out_dir.exists():
-            for existing in out_dir.rglob("*"):
-                if existing.is_file() and \
-                        existing.suffix.lower() in SUPPORTED_EXT:
-                    try:
-                        seen_hashes[file_hash(existing)] = str(existing)
-                    except Exception:
-                        pass
-            self._log(f"🔎 Duplikat terindeks di output: "
-                      f"{len(seen_hashes)}")
+        # Load Data dari Database SQLite
+        db_history = {}
+        if do_dup:
+            self._log("🔎 Memuat riwayat dari Database...")
+            try:
+                with sqlite3.connect(self.db_file) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT original_filename, output_filename FROM history")
+                    for row in cursor.fetchall():
+                        db_history[row[0]] = row[1]
+            except Exception as e:
+                self._log(f"⚠ Gagal load DB: {e}")
+            self._log(f"✅ Memuat {len(db_history)} riwayat file sukses.")
 
         next_num = start_num
         if do_rename:
@@ -880,13 +937,21 @@ class App(BaseWindow):
             try:
                 self.after(0, self._update_status, f"Memproses ({i}/{len(files)}): {f.name[:30]}...")
 
-                if do_dup:
-                    h = file_hash(f)
-                    if h in seen_hashes:
-                        self._log(f"⏭ SKIP duplikat: {f.name[:30]}...")
-                        self.after(0, self._set_progress, i)
-                        continue
-                    seen_hashes[h] = f.name
+                # Cek Duplikat berdasarkan Database
+                if do_dup and f.name in db_history:
+                    expected_out_name = db_history[f.name]
+                    if mode != "inplace" and out_dir:
+                        expected_out_path = out_dir / expected_out_name
+                        if expected_out_path.exists():
+                            self._log(f"⏭ SKIP (Ada di DB & file output valid): {f.name[:30]}...")
+                            self.after(0, self._set_progress, i)
+                            continue
+                    elif mode == "inplace":
+                        # Mode in-place, cek apakah file masih ada di input
+                        if f.exists():
+                            self._log(f"⏭ SKIP (Ada di DB): {f.name[:30]}...")
+                            self.after(0, self._set_progress, i)
+                            continue
 
                 if mode == "inplace":
                     target = f
@@ -922,6 +987,26 @@ class App(BaseWindow):
                     target.rename(new_target)
                     self._log(f"🔄 Fix Ekstensi: {target.name[:30]}... → {new_target.name[:30]}...")
                     target = new_target
+
+                if do_convert_jpeg and target.suffix.lower() not in (".jpg", ".jpeg"):
+                    if HAS_PIL:
+                        try:
+                            new_target = target.with_suffix(".jpg")
+                            with Image.open(target) as img:
+                                if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+                                    background = Image.new("RGB", img.size, (255, 255, 255))
+                                    background.paste(img, mask=img.split()[-1]) 
+                                    img = background
+                                else:
+                                    img = img.convert("RGB")
+                                img.save(new_target, "JPEG", quality=100, subsampling=0)
+                            
+                            target.unlink()
+                            old_name = target.name
+                            target = new_target
+                            self._log(f"🖼️ Convert to JPEG: {old_name[:30]}... → {target.name}")
+                        except Exception as e:
+                            self._log(f"⚠ Gagal Konversi JPEG: {e}")
 
                 original_stem = target.stem
                 title = format_text(original_stem, title_fmt)
@@ -964,13 +1049,13 @@ class App(BaseWindow):
                         self._log(f"⚠ Gagal cek resolusi: {e}")
 
                 if need_upscale:
-                    self.after(0, self._update_status, f"Upscaling 4x: {target.name}...")
+                    self.after(0, self._update_status, f"Upscaling {upscale_scale}x: {target.name}...")
                     upscaled = target.with_name(f"{target.stem}_upsc{target.suffix}")
-                    if self._upscale_image(target, upscaled, 4, upscale_model):
+                    if self._upscale_image(target, upscaled, upscale_scale, upscale_model):
                         try:
                             target.unlink()
                             upscaled.rename(target)
-                            self._log(f"⬆ Upscaled berhasil: {target.name}")
+                            self._log(f"⬆ Upscaled {upscale_scale}x berhasil: {target.name}")
                         except Exception as e:
                             self._log(f"⚠ Gagal replace upscaled: {e}")
 
@@ -981,6 +1066,7 @@ class App(BaseWindow):
                 cmd += ["-Keywords=", "-Subject=", "-IPTC:Keywords=", "-XMP-dc:Subject="]
                 
                 cmd += [
+                    f"-XMP-dc:Identifier={f.name.strip()}", 
                     f"-Title={title}",
                     f"-XMP-dc:Title={title}",
                     f"-Description={description}",
@@ -1007,6 +1093,17 @@ class App(BaseWindow):
                 if r.returncode != 0:
                     raise RuntimeError(
                         (r.stderr or r.stdout).strip())
+
+                # Simpan ke Database setelah sukses
+                try:
+                    with sqlite3.connect(self.db_file) as conn:
+                        conn.execute("""
+                            INSERT OR REPLACE INTO history (original_filename, output_filename)
+                            VALUES (?, ?)
+                        """, (f.name, target.name))
+                        conn.commit()
+                except Exception as e:
+                    self._log(f"⚠ Gagal simpan ke DB: {e}")
 
                 success += 1
                 results.append({
