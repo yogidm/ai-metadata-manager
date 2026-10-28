@@ -4,7 +4,7 @@ AI Metadata Manager (Complete & Fixed)
 ======================================
 Batch metadata + rename + duplicate detection (SQLite DB) + drag & drop + dark mode
 + Validasi 4MP, Auto-Upscale (2x/3x/4x), Suara Notifikasi, Simpan Config, 
-+ Auto-Convert JPEG, dan NLP Keyword Generation (Ollama Iterative Expansion).
++ Auto-Convert JPEG, dan NLP Keyword Generation (Ollama + Optional NLTK).
 """
 
 import os
@@ -34,8 +34,16 @@ except ImportError:
 try:
     import wordninja
     HAS_WORDNINJA = True
-except ImportError:
+except Exception:  # Catch ImportError & FileNotFoundError
     HAS_WORDNINJA = False
+
+# ---------- Optional: NLTK (WordNet) ---------- #
+try:
+    import nltk
+    from nltk.corpus import wordnet
+    HAS_NLTK = True
+except ImportError:
+    HAS_NLTK = False
 
 # ---------- Sound Notification (Bawaan Windows) ---------- #
 try:
@@ -70,10 +78,18 @@ except ImportError:
 
 
 # ============================================================ #
-#  KONFIG
+#  KONFIG & SETUP NLTK DATA PATH
 # ============================================================ #
 APP_NAME = "AI Metadata Manager"
 SUPPORTED_EXT = {".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff"}
+
+if getattr(sys, 'frozen', False):
+    _base_dir = Path(sys._MEIPASS)
+else:
+    _base_dir = Path(__file__).parent
+_nltk_path = _base_dir / "nltk_data"
+if _nltk_path.exists() and HAS_NLTK:
+    nltk.data.path.insert(0, str(_nltk_path))
 
 ADOBE_CATEGORIES = [
     "— none —", "1 · Animals", "2 · Buildings and Architecture", "3 · Business",
@@ -92,7 +108,7 @@ UPSCALER_MODELS = [
 
 TARGET_KEYWORDS = 49
 
-# Blacklist: Kata-kata instruksi yang tidak boleh muncul sebagai keyword
+# Daftar kata yang sama sekali tidak boleh muncul
 KEYWORD_BLACKLIST = {
     "objects", "subjects", "image", "images", "formats", "styles", "aesthetics",
     "colors", "audience", "visual", "forms", "safe", "diverse", "no", "punctuation",
@@ -100,7 +116,12 @@ KEYWORD_BLACKLIST = {
     "example", "output", "format", "rule", "rules", "critical", "strict", "task",
     "generate", "extract", "focus", "include", "must", "only", "word", "words",
     "keyword", "keywords", "single", "comma", "separated", "list", "json", "quote",
-    "quotes", "bullet", "points", "numbering", "true", "false", "null", "none"
+    "quotes", "bullet", "points", "numbering", "true", "false", "null", "none",
+    "type", "types", "content", "concept", "concepts", "noun", "nouns", "adjective",
+    # Tambahan kata aneh dari NLTK
+    "chickenhearted", "xanthous", "viridity", "orangeness", "unseamed", 
+    "nestling", "transmitter", "iterate", "restate", "flatbed", "unconditional",
+    "pawpaw", "papaia", "ananas", "medallion", "yellowness"
 }
 
 
@@ -127,7 +148,6 @@ def get_ollama_models() -> list[str]:
         return []
 
 def split_concatenated_word(word: str) -> list[str]:
-    """Memecah kata gabungan seperti 'happykids' menjadi ['happy', 'kids']."""
     if not HAS_WORDNINJA or len(word) < 8:
         return [word]
     try:
@@ -139,42 +159,50 @@ def split_concatenated_word(word: str) -> list[str]:
     return [word]
 
 def parse_comma_list(raw_text: str) -> list[str]:
-    """
-    Membersihkan output AI dan membuang kata-kata dari blacklist.
-    """
     if ":" in raw_text:
         raw_text = raw_text.split(":", 1)[1]
-        
     raw_text = raw_text.replace("'", "").replace('"', "")
     items = [k.strip() for k in raw_text.split(',') if k.strip()]
     
     final_keywords = []
     seen = set()
-    
     for item in items:
-        # Pisahkan CamelCase
         item = re.sub(r'(?<!^)(?=[A-Z])', ' ', item)
-        # Ganti hyphen/underscore
         item = re.sub(r'[-_/]', ' ', item)
-        
         words = item.split()
         for w in words:
             w = w.strip().lower()
-            
-            # Cek Blacklist (buang jika ada di blacklist)
             if w in KEYWORD_BLACKLIST:
                 continue
-                
             sub_words = split_concatenated_word(w)
             for sw in sub_words:
                 if len(sw) > 2 and sw not in seen and sw not in KEYWORD_BLACKLIST:
                     final_keywords.append(sw)
                     seen.add(sw)
-                
     return final_keywords
 
+def get_nltk_synonyms(word: str, max_per_word: int = 1) -> list[str]:
+    """Ambil maksimal 1 sinonim dari arti pertama (paling umum) di WordNet."""
+    if not HAS_NLTK: return []
+    synonyms = set()
+    try:
+        synsets = wordnet.synsets(word)
+        if not synsets: return []
+        
+        # HANYA ambil synset pertama (arti paling umum)
+        syn = synsets[0]
+        for lemma in syn.lemmas():
+            name = lemma.name().replace('_', ' ').lower()
+            # Hanya kata tunggal, bukan nama latin, beda dengan aslinya
+            if ' ' in name or name == word.lower() or not name.isalpha() or len(name) <= 3:
+                continue
+            if name not in KEYWORD_BLACKLIST:
+                synonyms.add(name)
+    except Exception:
+        pass
+    return list(synonyms)[:max_per_word]
+
 def extract_base_keywords(title: str, model_name: str) -> list[str]:
-    """Tahap 1: Prompt yang sangat sederhana dan langsung pada intinya."""
     prompt = (
         f"Image Title: '{title}'\n\n"
         f"Task: Write 20 single-word keywords for this image. Focus on the actual objects, colors, style, mood, and target audience visible in the title.\n\n"
@@ -182,8 +210,7 @@ def extract_base_keywords(title: str, model_name: str) -> list[str]:
         f"- ONLY one word per keyword.\n"
         f"- NO compound words like 'happykids' or 'minimaliststyle'.\n"
         f"- Use lowercase letters.\n"
-        f"- Output ONLY a comma-separated list.\n"
-        f"- Do NOT repeat any of these instruction words in your output.\n\n"
+        f"- Output ONLY a comma-separated list.\n\n"
         f"Output:"
     )
     try:
@@ -198,14 +225,11 @@ def extract_base_keywords(title: str, model_name: str) -> list[str]:
         return []
 
 def expand_keywords_iteratively(title: str, existing_kws: list[str], model_name: str, 
-                                 log_callback=None, target: int = TARGET_KEYWORDS, max_iter: int = 5) -> list[str]:
-    """Tahap 2+: Prompt yang sangat sederhana dan langsung pada intinya."""
+                                 log_callback=None, target: int = TARGET_KEYWORDS, max_iter: int = 3) -> list[str]:
     all_kws = list(existing_kws)
-    
     for iteration in range(1, max_iter + 1):
         if len(all_kws) >= target:
             break
-            
         needed = target - len(all_kws)
         request_count = min(needed + 5, 25)
         existing_str = ", ".join(all_kws[-30:])
@@ -213,13 +237,13 @@ def expand_keywords_iteratively(title: str, existing_kws: list[str], model_name:
         prompt = (
             f"Image Title: '{title}'\n"
             f"Existing Keywords: {existing_str}\n\n"
-            f"Task: Write {request_count} NEW single-word keywords for this image.\n\n"
+            f"Task: I need {request_count} more keywords to fill the quota. "
+            f"Find RELATED CONCEPTS (not exact synonyms) for the existing keywords above. "
+            f"For example, if you have 'pencil', you can add 'school', 'student', 'study'.\n\n"
             f"Rules:\n"
             f"- ONLY one word per keyword.\n"
-            f"- NO compound words like 'happykids' or 'minimaliststyle'.\n"
             f"- Do not repeat existing keywords.\n"
-            f"- Output ONLY a comma-separated list.\n"
-            f"- Do NOT repeat any of these instruction words in your output.\n\n"
+            f"- Output ONLY a comma-separated list.\n\n"
             f"Output:"
         )
         
@@ -227,34 +251,24 @@ def expand_keywords_iteratively(title: str, existing_kws: list[str], model_name:
             response = ollama.chat(
                 model=model_name,
                 messages=[{'role': 'user', 'content': prompt}],
-                options={'think': False, 'num_predict': 400, 'temperature': 0.5}
+                options={'think': False, 'num_predict': 400, 'temperature': 0.6}
             )
             new_kws = parse_comma_list(response['message']['content'].strip())
-            
             seen = set(k.lower().strip() for k in all_kws)
             added = 0
             for k in new_kws:
                 if k.lower() not in seen and k.lower() not in KEYWORD_BLACKLIST:
-                    all_kws.append(k)
-                    seen.add(k.lower())
-                    added += 1
+                    all_kws.append(k); seen.add(k.lower()); added += 1
                             
-            msg = f"  → Iterasi {iteration}: +{added} keyword (total {len(all_kws)})"
-            print(msg)
+            msg = f"  → Ollama Iterasi {iteration}: +{added} konsep (total {len(all_kws)})"
             if log_callback: log_callback(msg)
             
             if added == 0:
-                msg_stop = "  → AI tidak bisa menambah keyword baru. Berhenti."
-                print(msg_stop)
-                if log_callback: log_callback(msg_stop)
+                if log_callback: log_callback("  → Ollama tidak bisa menambah lagi.")
                 break
-                
         except Exception as e:
-            msg_err = f"Ollama Expand Error pada iterasi {iteration}: {e}"
-            print(msg_err)
-            if log_callback: log_callback(msg_err)
+            if log_callback: log_callback(f"Ollama Expand Error: {e}")
             break
-    
     return all_kws[:target]
 
 
@@ -286,7 +300,6 @@ def play_finish_sound(is_error=False):
         except Exception: pass
     threading.Thread(target=_play, daemon=True).start()
 
-
 def ensure_icon():
     icon_path = Path(__file__).with_name("icon.ico")
     if icon_path.exists(): return str(icon_path)
@@ -302,7 +315,6 @@ def ensure_icon():
     img.save(icon_path, sizes=[(16, 16), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])
     return str(icon_path)
 
-
 def format_text(stem, mode):
     if mode == "As-is": return stem
     text = re.sub(r"[_\-]+", " ", stem)
@@ -313,7 +325,6 @@ def format_text(stem, mode):
     if mode == "lowercase": return text.lower()
     return stem
 
-
 def split_keywords(raw):
     seen, out = set(), []
     for k in raw.split(","):
@@ -322,12 +333,10 @@ def split_keywords(raw):
             seen.add(k.lower()); out.append(k)
     return out
 
-
 def find_images(folder, recursive):
     p = Path(folder)
     it = p.rglob("*") if recursive else p.glob("*")
     return sorted(f for f in it if f.is_file() and f.suffix.lower() in SUPPORTED_EXT)
-
 
 def get_exiftool_path():
     script_dir = Path(__file__).parent
@@ -336,7 +345,6 @@ def get_exiftool_path():
         if local_exe.exists(): return str(local_exe)
     return shutil.which("exiftool")
 
-
 def check_exiftool():
     exe = get_exiftool_path()
     if not exe: return False, "ExifTool tidak ditemukan."
@@ -344,16 +352,14 @@ def check_exiftool():
     if exe_path.parent == Path(__file__).parent:
         files_dir = exe_path.parent / "exiftool_files"
         if not files_dir.exists() or not files_dir.is_dir():
-            return False, ("Folder 'exiftool_files' tidak ditemukan di samping exiftool.exe.")
+            return False, ("Folder 'exiftool_files' tidak ditemukan.")
     return True, ""
-
 
 def file_hash(path):
     h = hashlib.md5()
     with open(path, "rb") as fp:
         for chunk in iter(lambda: fp.read(65536), b""): h.update(chunk)
     return h.hexdigest()
-
 
 def get_next_number(scan_dir, prefix, start):
     if not scan_dir or not Path(scan_dir).exists(): return start
@@ -363,7 +369,6 @@ def get_next_number(scan_dir, prefix, start):
         m = re.match(rf"^{re.escape(prefix)}(\d+)$", f.stem)
         if m: max_num = max(max_num, int(m.group(1)))
     return max(max_num + 1, start)
-
 
 def find_upscaler():
     for name in ("realesrgan-ncnn-vulkan.exe", "realesrgan-ncnn-vulkan", "upscayl-bin.exe", "upscayl-bin"):
@@ -375,65 +380,54 @@ def find_upscaler():
 
 
 # ============================================================ #
-#  BASE WINDOW
+#  BASE WINDOW & APP
 # ============================================================ #
 if HAS_DND:
     class BaseWindow(TkinterDnD.Tk): pass
 else:
     class BaseWindow(tk.Tk): pass
 
-
-# ============================================================ #
-#  APP
-# ============================================================ #
 class App(BaseWindow):
     def __init__(self):
         super().__init__()
-
         if HAS_TTKBOOTSTRAP:
             self.style = ttkb.Style()
             self.style.theme_use("darkly")
             self._current_theme = "darkly"
         else:
             self._current_theme = "default"
-
         self.title(APP_NAME)
-        self.geometry("1280x980") 
+        self.geometry("1280x980")
         self.minsize(1080, 800)
-
         icon = ensure_icon()
         if icon:
             try: self.iconbitmap(icon)
             except Exception: pass
-
         self._processing = False
         self._total_files = 0
         self._last_results = []
-        self.tree_items = {} 
+        self.tree_items = {}
         
         if getattr(sys, 'frozen', False): self.app_dir = Path(sys.executable).parent
         else: self.app_dir = Path(__file__).parent
             
         self.config_file = self.app_dir / "config.json"
         self.db_file = self.app_dir / "riwayat_proses.db"
-
         self._init_db()
         self._build_ui()
-        self._load_config() 
+        self._load_config()
         self._refresh_ollama_models()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _init_db(self):
         try:
             with sqlite3.connect(self.db_file) as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
+                conn.cursor().execute("""
                     CREATE TABLE IF NOT EXISTS history (
                         original_filename TEXT PRIMARY KEY,
                         output_filename TEXT,
                         processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    )
-                """)
+                    )""")
                 conn.commit()
         except Exception as e: print(f"Gagal inisialisasi DB: {e}")
 
@@ -443,13 +437,12 @@ class App(BaseWindow):
             self.ollama_combo['values'] = models
             if self.ollama_model_var.get() not in models:
                 self.ollama_model_var.set(models[0])
-            self._log(f"✅ {len(models)} model Ollama dimuat ke dropdown.")
+            self._log(f"✅ {len(models)} model Ollama dimuat.")
         else:
-            self._log("⚠ Tidak ada model Ollama ditemukan / server Ollama tidak berjalan.")
+            self._log("⚠ Model Ollama tidak ditemukan.")
 
     def _on_close(self):
-        self._save_config()
-        self.destroy()
+        self._save_config(); self.destroy()
 
     def _load_config(self):
         if self.config_file.exists():
@@ -476,37 +469,25 @@ class App(BaseWindow):
                 json.dump(data, f, indent=4)
         except Exception as e: self._log(f"⚠ Gagal menyimpan config: {e}")
 
-    # -------------------- UI -------------------- #
     def _build_ui(self):
-        topbar = ttkb.Frame(self, padding=(12, 8))
-        topbar.pack(fill="x")
+        topbar = ttkb.Frame(self, padding=(12, 8)); topbar.pack(fill="x")
         ttkb.Label(topbar, text=APP_NAME, font=("Segoe UI", 14, "bold")).pack(side="left")
         if HAS_TTKBOOTSTRAP:
             ttkb.Button(topbar, text="🌙 Toggle Theme", command=self._toggle_theme, width=15).pack(side="right", padx=4)
-
-        nb = ttkb.Notebook(self)
-        nb.pack(fill="both", expand=True, padx=8, pady=(0, 8))
-
+        nb = ttkb.Notebook(self); nb.pack(fill="both", expand=True, padx=8, pady=(0, 8))
         self.main_tab = ttkb.Frame(nb, padding=12)
         self.adv_tab = ttkb.Frame(nb, padding=12)
-        nb.add(self.main_tab, text="  Main  ")
-        nb.add(self.adv_tab, text="  Advanced  ")
-
-        self._build_main_tab()
-        self._build_advanced_tab()
+        nb.add(self.main_tab, text="  Main  "); nb.add(self.adv_tab, text="  Advanced  ")
+        self._build_main_tab(); self._build_advanced_tab()
 
     def _build_main_tab(self):
-        f = self.main_tab
-        f.columnconfigure(1, weight=1)
-        row = 0
-
+        f = self.main_tab; f.columnconfigure(1, weight=1); row = 0
         drop_box = ttkb.LabelFrame(f, text="Drop Folder / File di sini (atau Browse)", padding=10)
         drop_box.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(0, 10))
         self.drop_label = ttkb.Label(drop_box, text="📁  Drag & Drop folder ke sini", anchor="center", font=("Segoe UI", 11))
         self.drop_label.pack(fill="x", pady=12)
         if HAS_DND:
-            self.drop_label.drop_target_register(DND_FILES)
-            self.drop_label.dnd_bind("<<Drop>>", self._on_drop_input)
+            self.drop_label.drop_target_register(DND_FILES); self.drop_label.dnd_bind("<<Drop>>", self._on_drop_input)
 
         row += 1
         ttkb.Label(f, text="Input folder:").grid(row=row, column=0, sticky="w", pady=4)
@@ -515,27 +496,23 @@ class App(BaseWindow):
         self.input_entry.grid(row=row, column=1, sticky="ew", padx=6)
         ttkb.Button(f, text="Browse…", command=self._pick_input, width=10).grid(row=row, column=2)
         if HAS_DND:
-            self.input_entry.drop_target_register(DND_FILES)
-            self.input_entry.dnd_bind("<<Drop>>", self._on_drop_input)
+            self.input_entry.drop_target_register(DND_FILES); self.input_entry.dnd_bind("<<Drop>>", self._on_drop_input)
 
         row += 1
         ttkb.Label(f, text="Output folder:").grid(row=row, column=0, sticky="w", pady=4)
         self.output_var = tk.StringVar()
         self.output_entry = ttkb.Entry(f, textvariable=self.output_var)
         self.output_entry.grid(row=row, column=1, sticky="ew", padx=6)
-        out_btns = ttkb.Frame(f)
-        out_btns.grid(row=row, column=2)
+        out_btns = ttkb.Frame(f); out_btns.grid(row=row, column=2)
         ttkb.Button(out_btns, text="Browse…", command=self._pick_output, width=10).pack(side="left")
         ttkb.Button(out_btns, text="⇄", command=self._swap_folders, width=3).pack(side="left", padx=(2, 0))
         if HAS_DND:
-            self.output_entry.drop_target_register(DND_FILES)
-            self.output_entry.dnd_bind("<<Drop>>", self._on_drop_output)
+            self.output_entry.drop_target_register(DND_FILES); self.output_entry.dnd_bind("<<Drop>>", self._on_drop_output)
 
         row += 1
         ttkb.Label(f, text="Mode:").grid(row=row, column=0, sticky="w", pady=4)
         self.mode_var = tk.StringVar(value="copy")
-        mframe = ttkb.Frame(f)
-        mframe.grid(row=row, column=1, columnspan=2, sticky="w", padx=6)
+        mframe = ttkb.Frame(f); mframe.grid(row=row, column=1, columnspan=2, sticky="w", padx=6)
         for text, val in [("Copy (aman)", "copy"), ("Move", "move"), ("In-place (overwrite)", "inplace")]:
             ttkb.Radiobutton(mframe, text=text, value=val, variable=self.mode_var).pack(side="left", padx=4)
 
@@ -549,14 +526,14 @@ class App(BaseWindow):
 
         row += 1
         self.ai_tag_var = tk.BooleanVar(value=True)
-        ttkb.Checkbutton(f, text='Tambahkan keyword "AI, AI Generated" (Adobe Stock AI rule)', variable=self.ai_tag_var).grid(row=row, column=1, columnspan=2, sticky="w", padx=6, pady=4)
+        ttkb.Checkbutton(f, text='Tambahkan keyword "AI, AI Generated"', variable=self.ai_tag_var).grid(row=row, column=1, columnspan=2, sticky="w", padx=6, pady=4)
 
         row += 1
         ttkb.Label(f, text="Extra keywords:").grid(row=row, column=0, sticky="nw", pady=4)
         self.extra_kw_var = tk.StringVar()
         ttkb.Entry(f, textvariable=self.extra_kw_var).grid(row=row, column=1, sticky="ew", padx=6, columnspan=2)
         row += 1
-        ttkb.Label(f, text="(Opsional. Bisa dikosongkan jika akan dilengkapi via NLP/Ollama)", foreground="#888").grid(row=row, column=1, columnspan=2, sticky="w", padx=6)
+        ttkb.Label(f, text="(Opsional)", foreground="#888").grid(row=row, column=1, columnspan=2, sticky="w", padx=6)
 
         row += 1
         ttkb.Label(f, text="Format Title:").grid(row=row, column=0, sticky="w", pady=4)
@@ -568,64 +545,42 @@ class App(BaseWindow):
         ttkb.Checkbutton(f, text="Proses sub-folder (recursive)", variable=self.recursive_var).grid(row=row, column=1, columnspan=2, sticky="w", padx=6)
 
         row += 1
-        btns = ttkb.Frame(f)
-        btns.grid(row=row, column=0, columnspan=3, sticky="ew", pady=12)
+        btns = ttkb.Frame(f); btns.grid(row=row, column=0, columnspan=3, sticky="ew", pady=12)
         ttkb.Button(btns, text="🔍  Preview", command=self._preview).pack(side="left", padx=(0, 8))
         self.process_btn = ttkb.Button(btns, text="▶  Mulai Proses", command=self._start)
         self.process_btn.pack(side="left", padx=4)
         ttkb.Button(btns, text="📄  Export CSV", command=self._export_csv).pack(side="right")
 
-        # --- BOTTOM SECTION (Table & Log) ---
         row += 1
         bottom_frame = ttkb.Frame(f)
         bottom_frame.grid(row=row, column=0, columnspan=3, sticky="nsew")
-        bottom_frame.columnconfigure(0, weight=2) 
-        bottom_frame.columnconfigure(1, weight=1) 
-        bottom_frame.rowconfigure(0, weight=1)
+        bottom_frame.columnconfigure(0, weight=2); bottom_frame.columnconfigure(1, weight=1); bottom_frame.rowconfigure(0, weight=1)
 
-        table_frame = ttkb.Frame(bottom_frame)
-        table_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
-        table_frame.columnconfigure(0, weight=1)
-        table_frame.rowconfigure(0, weight=1)
-
-        style = ttkb.Style()
-        style.configure("Treeview", rowheight=25)
+        table_frame = ttkb.Frame(bottom_frame); table_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
+        table_frame.columnconfigure(0, weight=1); table_frame.rowconfigure(0, weight=1)
+        style = ttkb.Style(); style.configure("Treeview", rowheight=25)
         cols = ("new_filename", "title", "keywords")
         self.tree = ttkb.Treeview(table_frame, columns=cols, show="headings", height=8)
-        
-        self.tree.heading("new_filename", text="New Filename")
-        self.tree.column("new_filename", width=200, minwidth=150, stretch=False)
-        self.tree.heading("title", text="Title")
-        self.tree.column("title", width=350, minwidth=250, stretch=False)
-        self.tree.heading("keywords", text="Keywords")
-        self.tree.column("keywords", width=400, minwidth=250, stretch=False)
-        
+        self.tree.heading("new_filename", text="New Filename"); self.tree.column("new_filename", width=200, minwidth=150, stretch=False)
+        self.tree.heading("title", text="Title"); self.tree.column("title", width=350, minwidth=250, stretch=False)
+        self.tree.heading("keywords", text="Keywords"); self.tree.column("keywords", width=400, minwidth=250, stretch=False)
         self.tree.bind("<Double-1>", self._show_full_text)
-
         self.tree.grid(row=0, column=0, sticky="nsew")
-        sb_v = ttkb.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
-        sb_v.grid(row=0, column=1, sticky="ns")
-        sb_h = ttkb.Scrollbar(table_frame, orient="horizontal", command=self.tree.xview)
-        sb_h.grid(row=1, column=0, sticky="ew")
+        sb_v = ttkb.Scrollbar(table_frame, orient="vertical", command=self.tree.yview); sb_v.grid(row=0, column=1, sticky="ns")
+        sb_h = ttkb.Scrollbar(table_frame, orient="horizontal", command=self.tree.xview); sb_h.grid(row=1, column=0, sticky="ew")
         self.tree.configure(yscrollcommand=sb_v.set, xscrollcommand=sb_h.set)
 
         log_frame = ttkb.LabelFrame(bottom_frame, text="Log", padding=5)
         log_frame.grid(row=0, column=1, sticky="nsew")
-        log_frame.columnconfigure(0, weight=1)
-        log_frame.rowconfigure(0, weight=1)
-
+        log_frame.columnconfigure(0, weight=1); log_frame.rowconfigure(0, weight=1)
         self.log_text = tk.Text(log_frame, wrap="word", font=("Consolas", 9), bg="#1e1e1e", fg="#d4d4d4", insertbackground="white")
-        
-        # Setup warna untuk Log
-        self.log_text.tag_config("success", foreground="#4CAF50") # Hijau
-        self.log_text.tag_config("error", foreground="#F44336")   # Merah
-        self.log_text.tag_config("warning", foreground="#FFC107") # Kuning
-        self.log_text.tag_config("info", foreground="#2196F3")    # Biru
-        self.log_text.tag_config("normal", foreground="#d4d4d4")  # Normal
-
+        self.log_text.tag_config("success", foreground="#4CAF50")
+        self.log_text.tag_config("error", foreground="#F44336")
+        self.log_text.tag_config("warning", foreground="#FFC107")
+        self.log_text.tag_config("info", foreground="#2196F3")
+        self.log_text.tag_config("normal", foreground="#d4d4d4")
         self.log_text.grid(row=0, column=0, sticky="nsew")
-        log_sb = ttkb.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
-        log_sb.grid(row=0, column=1, sticky="ns")
+        log_sb = ttkb.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview); log_sb.grid(row=0, column=1, sticky="ns")
         self.log_text.configure(yscrollcommand=log_sb.set)
 
         row += 1
@@ -634,112 +589,89 @@ class App(BaseWindow):
         row += 1
         self.progress_label = ttkb.Label(f, text="Siap.", foreground="#888")
         self.progress_label.grid(row=row, column=0, columnspan=3, sticky="w")
-        
         f.rowconfigure(row - 2, weight=1)
 
     def _build_advanced_tab(self):
-        f = self.adv_tab
-        f.columnconfigure(0, weight=1)
-        row = 0
-
+        f = self.adv_tab; f.columnconfigure(0, weight=1); row = 0
         box_res = ttkb.LabelFrame(f, text="Validasi & Kualitas (Adobe Stock)", padding=10)
-        box_res.grid(row=row, column=0, sticky="ew", pady=(0, 10))
-        box_res.columnconfigure(0, weight=1)
-
+        box_res.grid(row=row, column=0, sticky="ew", pady=(0, 10)); box_res.columnconfigure(0, weight=1)
         self.validate_mp_var = tk.BooleanVar(value=True)
         ttkb.Checkbutton(box_res, text="Validasi minimal 4 Megapiksel (Standar Adobe Stock)", variable=self.validate_mp_var).grid(row=0, column=0, sticky="w", pady=2)
-
         self.auto_upscale_small_var = tk.BooleanVar(value=True)
         ttkb.Checkbutton(box_res, text="Auto-Upscale JIKA resolusi di bawah 4 MP", variable=self.auto_upscale_small_var).grid(row=1, column=0, sticky="w", pady=2)
-
         self.convert_jpeg_var = tk.BooleanVar(value=True)
         ttkb.Checkbutton(box_res, text="Konversi ke JPEG (Wajib untuk Adobe Stock Ilustrasi)", variable=self.convert_jpeg_var).grid(row=2, column=0, sticky="w", pady=2)
 
         row += 1
-        box_nlp = ttkb.LabelFrame(f, text="NLP Keyword Generation (Ollama Iterative Expansion)", padding=10)
-        box_nlp.grid(row=row, column=0, sticky="ew", pady=(0, 10))
-        box_nlp.columnconfigure(1, weight=1)
-
+        box_nlp = ttkb.LabelFrame(f, text="NLP Keyword Generation (Ollama + NLTK)", padding=10)
+        box_nlp.grid(row=row, column=0, sticky="ew", pady=(0, 10)); box_nlp.columnconfigure(1, weight=1)
         self.nlp_enable_var = tk.BooleanVar(value=True)
-        ttkb.Checkbutton(box_nlp, text="Aktifkan Keyword Expansion via Ollama (Loop hingga 49 keyword)", variable=self.nlp_enable_var).grid(row=0, column=0, columnspan=3, sticky="w", pady=2)
+        ttkb.Checkbutton(box_nlp, text="Aktifkan Hybrid NLP (Loop hingga 49 keyword)", variable=self.nlp_enable_var).grid(row=0, column=0, columnspan=3, sticky="w", pady=2)
+        
+        # Checkbox NLTK
+        self.use_nltk_var = tk.BooleanVar(value=False) # Default False agar aman
+        ttkb.Checkbutton(box_nlp, text="Gunakan NLTK WordNet untuk Sinonim (Opsional, kadang aneh)", variable=self.use_nltk_var).grid(row=1, column=0, columnspan=3, sticky="w", pady=2)
 
-        ttkb.Label(box_nlp, text="Ollama Model:").grid(row=1, column=0, sticky="w", pady=2)
+        ttkb.Label(box_nlp, text="Ollama Model:").grid(row=2, column=0, sticky="w", pady=2)
         self.ollama_model_var = tk.StringVar(value="")
         self.ollama_combo = ttkb.Combobox(box_nlp, textvariable=self.ollama_model_var, width=25)
-        self.ollama_combo.grid(row=1, column=1, sticky="w", padx=6)
-        ttkb.Button(box_nlp, text="🔄", command=self._refresh_ollama_models, width=3).grid(row=1, column=2)
+        self.ollama_combo.grid(row=2, column=1, sticky="w", padx=6)
+        ttkb.Button(box_nlp, text="🔄", command=self._refresh_ollama_models, width=3).grid(row=2, column=2)
 
         row += 1
         box4 = ttkb.LabelFrame(f, text="Manual Upscale (Real-ESRGAN / Upscayl)", padding=10)
-        box4.grid(row=row, column=0, sticky="ew", pady=(0, 10))
-        box4.columnconfigure(1, weight=1)
-
+        box4.grid(row=row, column=0, sticky="ew", pady=(0, 10)); box4.columnconfigure(1, weight=1)
         self.upscale_var = tk.BooleanVar(value=False)
-        ttkb.Checkbutton(box4, text="Paksa Upscale SEMUA gambar setelah proses", variable=self.upscale_var).grid(row=0, column=0, columnspan=3, sticky="w", pady=2)
-
+        ttkb.Checkbutton(box4, text="Paksa Upscale SEMUA gambar", variable=self.upscale_var).grid(row=0, column=0, columnspan=3, sticky="w", pady=2)
         ttkb.Label(box4, text="Upscaler exe:").grid(row=1, column=0, sticky="w", pady=2)
         self.upscaler_path_var = tk.StringVar(value="")
         ttkb.Entry(box4, textvariable=self.upscaler_path_var).grid(row=1, column=1, sticky="ew", padx=6)
         ttkb.Button(box4, text="Browse…", command=self._pick_upscaler, width=10).grid(row=1, column=2)
-
         ttkb.Label(box4, text="Model:").grid(row=2, column=0, sticky="w", pady=2)
         self.upscale_model_var = tk.StringVar(value=UPSCALER_MODELS[0])
         ttkb.Combobox(box4, textvariable=self.upscale_model_var, state="readonly", values=UPSCALER_MODELS, width=30).grid(row=2, column=1, sticky="w", padx=6)
-
         ttkb.Label(box4, text="Scale:").grid(row=3, column=0, sticky="w", pady=2)
         self.upscale_scale_var = tk.StringVar(value="4x")
         ttkb.Combobox(box4, textvariable=self.upscale_scale_var, state="readonly", values=["2x", "3x", "4x"], width=10).grid(row=3, column=1, sticky="w", padx=6)
 
         row += 1
         box1 = ttkb.LabelFrame(f, text="Metadata Tambahan", padding=10)
-        box1.grid(row=row, column=0, sticky="ew", pady=(0, 10))
-        box1.columnconfigure(1, weight=1)
-
+        box1.grid(row=row, column=0, sticky="ew", pady=(0, 10)); box1.columnconfigure(1, weight=1)
         ttkb.Label(box1, text="Category:").grid(row=0, column=0, sticky="w", pady=2)
         self.category_var = tk.StringVar(value="— none —")
         ttkb.Combobox(box1, textvariable=self.category_var, state="readonly", values=ADOBE_CATEGORIES, width=40).grid(row=0, column=1, sticky="w", padx=6)
-
         ttkb.Label(box1, text="Alt Text:").grid(row=1, column=0, sticky="w", pady=2)
         self.alt_var = tk.StringVar(value="")
         ttkb.Entry(box1, textvariable=self.alt_var).grid(row=1, column=1, sticky="ew", padx=6)
-        ttkb.Label(box1, text="(kosongkan = sama dengan Title)", foreground="#888").grid(row=2, column=1, sticky="w", padx=6)
-        
+
         row += 1
         box_sec = ttkb.LabelFrame(f, text="Keamanan & Database", padding=10)
-        box_sec.grid(row=row, column=0, sticky="ew", pady=(0, 10))
-        box_sec.columnconfigure(0, weight=1)
-
+        box_sec.grid(row=row, column=0, sticky="ew", pady=(0, 10)); box_sec.columnconfigure(0, weight=1)
         self.dup_check_var = tk.BooleanVar(value=True)
         ttkb.Checkbutton(box_sec, text="Deteksi duplikat (Cek Database Riwayat)", variable=self.dup_check_var).grid(row=0, column=0, sticky="w", pady=2)
         ttkb.Button(box_sec, text="🗑️ Reset Database Riwayat", command=self._reset_db, bootstyle="danger-outline").grid(row=1, column=0, sticky="w", pady=6)
-
         self.backup_var = tk.BooleanVar(value=False)
         ttkb.Checkbutton(box_sec, text="Buat backup _original (mode in-place)", variable=self.backup_var).grid(row=2, column=0, sticky="w", pady=2)
 
         row += 1
         box2 = ttkb.LabelFrame(f, text="Batch Rename", padding=10)
-        box2.grid(row=row, column=0, sticky="ew", pady=(0, 10))
-        box2.columnconfigure(1, weight=1)
-
+        box2.grid(row=row, column=0, sticky="ew", pady=(0, 10)); box2.columnconfigure(1, weight=1)
         self.rename_enable_var = tk.BooleanVar(value=True)
         ttkb.Checkbutton(box2, text="Aktifkan batch rename", variable=self.rename_enable_var).grid(row=0, column=0, columnspan=2, sticky="w", pady=2)
-
         ttkb.Label(box2, text="Pattern:").grid(row=1, column=0, sticky="w", pady=2)
         self.rename_pattern_var = tk.StringVar(value="demhndAIStock_{num:05d}")
         ttkb.Entry(box2, textvariable=self.rename_pattern_var).grid(row=1, column=1, sticky="ew", padx=6)
-
         ttkb.Label(box2, text="Start Number:").grid(row=3, column=0, sticky="w", pady=2)
         self.start_num_var = tk.IntVar(value=1)
         ttkb.Spinbox(box2, from_=1, to=99999, textvariable=self.start_num_var, width=12).grid(row=3, column=1, sticky="w", padx=6)
 
     def _reset_db(self):
-        if messagebox.askyesno("Konfirmasi", "Hapus semua riwayat di database?\nAplikasi akan memproses ulang semua file dari awal."):
+        if messagebox.askyesno("Konfirmasi", "Hapus semua riwayat di database?"):
             try:
                 with sqlite3.connect(self.db_file) as conn: conn.execute("DELETE FROM history")
-                self._log("🗑️ Database riwayat berhasil di-reset.")
-            except Exception as e: self._log(f"⚠ Gagal reset DB: {e}")
+                self._log("🗑️ Database di-reset.")
+            except Exception as e: self._log(f"⚠ Gagal: {e}")
 
-    # -------------------- Actions -------------------- #
     def _toggle_theme(self):
         if not HAS_TTKBOOTSTRAP: return
         if self._current_theme == "darkly":
@@ -749,60 +681,48 @@ class App(BaseWindow):
 
     def _swap_folders(self):
         a = self.input_var.get(); b = self.output_var.get()
-        self.input_var.set(b); self.output_var.set(a)
-        self._save_config()
+        self.input_var.set(b); self.output_var.set(a); self._save_config()
 
     def _pick_input(self):
-        d = filedialog.askdirectory(title="Pilih folder input")
+        d = filedialog.askdirectory()
         if d: self.input_var.set(d); self._save_config()
 
     def _pick_output(self):
-        d = filedialog.askdirectory(title="Pilih folder output")
+        d = filedialog.askdirectory()
         if d: self.output_var.set(d); self._save_config()
 
     def _pick_upscaler(self):
-        p = filedialog.askopenfilename(title="Pilih upscaler executable", filetypes=[("Executable", "*.exe"), ("All files", "*.*")])
-        if p: self.upscaler_path_var.set(p); self._save_config() 
+        p = filedialog.askopenfilename(filetypes=[("Executable", "*.exe"), ("All files", "*.*")])
+        if p: self.upscaler_path_var.set(p); self._save_config()
 
     def _parse_drop_paths(self, data):
-        matches = re.findall(r'\{([^}]+)\}|(\S+)', data)
-        return [a or b for a, b in matches]
+        return [a or b for a, b in re.findall(r'\{([^}]+)\}|(\S+)', data)]
 
     def _on_drop_input(self, event):
         paths = self._parse_drop_paths(event.data)
-        if not paths: return
-        p = paths[0]
-        if os.path.isdir(p): self.input_var.set(p)
-        elif os.path.isfile(p): self.input_var.set(os.path.dirname(p))
-        self._save_config()
+        if paths:
+            p = paths[0]
+            self.input_var.set(p if os.path.isdir(p) else os.path.dirname(p))
+            self._save_config()
 
     def _on_drop_output(self, event):
         paths = self._parse_drop_paths(event.data)
-        if not paths: return
-        p = paths[0]
-        if os.path.isdir(p): self.output_var.set(p)
-        elif os.path.isfile(p): self.output_var.set(os.path.dirname(p))
-        self._save_config()
+        if paths:
+            p = paths[0]
+            self.output_var.set(p if os.path.isdir(p) else os.path.dirname(p))
+            self._save_config()
 
     def _log(self, msg):
         def _append():
-            # Tentukan warna berdasarkan isi pesan
             tag = "normal"
-            if "✔" in msg or "✅" in msg or "⬆" in msg or "🖼️" in msg or "📝" in msg:
-                tag = "success"
-            elif "✗" in msg or "Error" in msg:
-                tag = "error"
-            elif "⚠" in msg or "Peringatan" in msg:
-                tag = "warning"
-            elif "⏭" in msg or "🔄" in msg or "ℹ" in msg or "▶" in msg or "🧠" in msg or "✅" in msg:
-                tag = "info"
-
+            if "✔" in msg or "✅" in msg or "⬆" in msg or "🖼️" in msg or "📝" in msg: tag = "success"
+            elif "✗" in msg or "Error" in msg: tag = "error"
+            elif "⚠" in msg: tag = "warning"
+            elif "⏭" in msg or "🔄" in msg or "ℹ" in msg or "▶" in msg or "🧠" in msg: tag = "info"
             self.log_text.insert("end", msg + "\n", tag)
             self.log_text.see("end")
             lines = int(self.log_text.index('end-1c').split('.')[0])
-            # Dibatasi hanya 200 baris terakhir
-            if lines > 200: 
-                self.log_text.delete('1.0', f'{lines-200}.0')
+            if lines > 200: self.log_text.delete('1.0', f'{lines-200}.0')
         self.after(0, _append)
 
     def _set_progress(self, value):
@@ -810,8 +730,7 @@ class App(BaseWindow):
         pct = int(value / self._total_files * 100) if self._total_files else 0
         self.progress_label.config(text=f"{value} / {self._total_files} ({pct}%)")
 
-    def _update_status(self, msg):
-        self.progress_label.config(text=msg)
+    def _update_status(self, msg): self.progress_label.config(text=msg)
 
     def _update_tree_row(self, orig_name, new_name, title, kw_str):
         item_id = self.tree_items.get(orig_name)
@@ -831,24 +750,19 @@ class App(BaseWindow):
         if not os.path.isdir(input_dir): messagebox.showerror("Error", "Folder input tidak valid."); return
         files = find_images(input_dir, self.recursive_var.get())
         for i in self.tree.get_children(): self.tree.delete(i)
-
         kw_str = ", ".join(self._collect_keywords())
-        
         self.tree_items = {}
         for f in files:
             item_id = self.tree.insert("", "end", values=("-", "-", kw_str))
             self.tree_items[f.name] = item_id
-            
         self.progress_label.config(text=f"Preview: {len(files)} file")
 
     def _show_full_text(self, event):
         item = self.tree.identify_row(event.y)
         if not item: return
         values = self.tree.item(item, "values")
-        
         detail_win = tk.Toplevel(self)
-        detail_win.title("Detail File")
-        detail_win.geometry("600x350")
+        detail_win.title("Detail File"); detail_win.geometry("600x350")
         txt = tk.Text(detail_win, wrap="word", padx=10, pady=10, bg="#1e1e1e", fg="#d4d4d4", font=("Segoe UI", 10))
         txt.pack(fill="both", expand=True)
         txt.insert("end", f"NEW FILENAME:\n{values[0]}\n\nTITLE:\n{values[1]}\n\nKEYWORDS:\n{values[2]}\n")
@@ -856,42 +770,32 @@ class App(BaseWindow):
 
     def _start(self):
         if self._processing: return
-        self._save_config() 
-
+        self._save_config()
         ok, err_msg = check_exiftool()
         if not ok: messagebox.showerror("ExifTool tidak siap", err_msg); return
-
         input_dir = self.input_var.get().strip()
         if not os.path.isdir(input_dir): messagebox.showerror("Error", "Folder input tidak valid."); return
-
         mode = self.mode_var.get()
         output_dir = self.output_var.get().strip()
-
         if mode != "inplace":
             if not output_dir: messagebox.showerror("Error", "Folder output wajib diisi."); return
             try: os.makedirs(output_dir, exist_ok=True)
-            except OSError as e: messagebox.showerror("Error", f"Tidak bisa membuat output folder:\n{e}"); return
-
+            except OSError as e: messagebox.showerror("Error", f"Tidak bisa membuat folder:\n{e}"); return
         if self.upscale_var.get() or self.auto_upscale_small_var.get():
             upscaler = self.upscaler_path_var.get().strip() or find_upscaler()
-            if not upscaler: messagebox.showerror("Upscaler tidak ditemukan", "Pilih path upscaler exe di tab Advanced."); return
-
+            if not upscaler: messagebox.showerror("Upscaler tidak ditemukan", "Pilih path upscaler exe."); return
         if self.nlp_enable_var.get() and not HAS_OLLAMA:
-            messagebox.showerror("Ollama Error", "Fitur NLP diaktifkan, tapi library 'ollama' belum terinstall."); return
+            messagebox.showerror("Ollama Error", "Library 'ollama' belum terinstall."); return
         if self.nlp_enable_var.get() and not self.ollama_model_var.get().strip():
-            messagebox.showerror("Model Kosong", "Kamu mengaktifkan NLP, tapi belum memilih model Ollama."); return
-
+            messagebox.showerror("Model Kosong", "Pilih model Ollama."); return
         files = find_images(input_dir, self.recursive_var.get())
-        if not files: messagebox.showinfo("Info", "Tidak ada gambar yang didukung."); return
-
+        if not files: messagebox.showinfo("Info", "Tidak ada gambar."); return
         self._processing = True
         self.process_btn.config(state="disabled")
         self._total_files = len(files)
-        self.progress["maximum"] = len(files)
-        self.progress["value"] = 0
+        self.progress["maximum"] = len(files); self.progress["value"] = 0
         self.progress_label.config(text=f"0 / {len(files)} (0%)")
         self._log(f"▶ Mulai {len(files)} file…")
-        
         threading.Thread(target=self._worker, args=(files,), daemon=True).start()
 
     def _upscale_image(self, src, dst, scale, model):
@@ -899,23 +803,20 @@ class App(BaseWindow):
         if not upscaler: return False
         exe_name = Path(upscaler).name.lower()
         cmd = [upscaler, "-i", str(src), "-o", str(dst), "-s", "4", "-m" if "upscayl" in exe_name else "-n", model]
-        
         try:
             flags = (subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=120, creationflags=flags)
-            if r.returncode != 0: self._log(f"✗ Upscale error: {Path(src).name}"); return False
-            if not Path(dst).exists(): self._log(f"✗ Upscale gagal: File output tidak terbuat."); return False
-                
+            if r.returncode != 0: return False
+            if not Path(dst).exists(): return False
             if scale < 4 and HAS_PIL:
                 try:
                     with Image.open(dst) as img:
                         w, h = img.size
                         resized = img.resize((int(w * (scale / 4)), int(h * (scale / 4))), Image.LANCZOS)
                         resized.save(dst)
-                except Exception as e: self._log(f"⚠ Gagal resize ke {scale}x: {e}")
+                except Exception: pass
             return True
-        except subprocess.TimeoutExpired: self._log(f"✗ Upscale timeout: {Path(src).name}"); return False
-        except Exception as e: self._log(f"✗ Upscale error: {e}"); return False
+        except Exception: return False
 
     def _worker(self, files):
         author = self.author_var.get().strip() or "AI Generated"
@@ -925,7 +826,6 @@ class App(BaseWindow):
         cat_num = category.split("·")[0].strip() if category and category != "— none —" else None
 
         manual_kw_list = self._collect_keywords()
-
         mode = self.mode_var.get()
         in_dir = Path(self.input_var.get())
         out_dir = Path(self.output_var.get()) if mode != "inplace" else None
@@ -937,53 +837,48 @@ class App(BaseWindow):
         do_convert_jpeg = self.convert_jpeg_var.get()
         
         do_nlp = self.nlp_enable_var.get()
+        use_nltk = self.use_nltk_var.get()
         ollama_model = self.ollama_model_var.get().strip()
-        
         upscale_model = self.upscale_model_var.get()
         upscale_scale = int(self.upscale_scale_var.get().replace("x", ""))
-        
         do_rename = self.rename_enable_var.get()
         rename_pattern = self.rename_pattern_var.get().strip()
         start_num = self.start_num_var.get()
 
         db_history = {}
         if do_dup:
-            self._log("🔎 Memuat riwayat dari Database...")
+            self._log("🔎 Memuat riwayat DB...")
             try:
                 with sqlite3.connect(self.db_file) as conn:
                     cursor = conn.cursor()
                     cursor.execute("SELECT original_filename, output_filename FROM history")
                     for row in cursor.fetchall(): db_history[row[0]] = row[1]
             except Exception as e: self._log(f"⚠ Gagal load DB: {e}")
-            self._log(f"✅ Memuat {len(db_history)} riwayat file sukses.")
+            self._log(f"✅ Memuat {len(db_history)} riwayat.")
 
         next_num = start_num
         if do_rename:
             scan_dir = out_dir if mode != "inplace" else in_dir
             prefix = (rename_pattern.split("{")[0] if "{" in rename_pattern else rename_pattern)
             next_num = get_next_number(scan_dir, prefix, start_num)
-            self._log(f"📛 Rename dimulai dari nomor: {next_num}")
+            self._log(f"📛 Rename dimulai dari: {next_num}")
 
         success, errors, results = 0, [], []
 
         for i, f in enumerate(files, 1):
             try:
                 self.after(0, self._update_status, f"Memproses ({i}/{len(files)}): {f.name[:30]}...")
-
                 if do_dup and f.name in db_history:
                     expected_out_name = db_history[f.name]
                     if mode != "inplace" and out_dir:
-                        expected_out_path = out_dir / expected_out_name
-                        if expected_out_path.exists():
-                            self._log(f"⏭ SKIP (Ada di DB & file output valid): {f.name[:30]}...")
+                        if (out_dir / expected_out_name).exists():
+                            self._log(f"⏭ SKIP (Ada di DB): {f.name[:30]}...")
                             self.after(0, self._update_tree_row, f.name, expected_out_name, "-", "-")
-                            self.after(0, self._set_progress, i)
-                            continue
+                            self.after(0, self._set_progress, i); continue
                     elif mode == "inplace" and f.exists():
                         self._log(f"⏭ SKIP (Ada di DB): {f.name[:30]}...")
                         self.after(0, self._update_tree_row, f.name, f.name, "-", "-")
-                        self.after(0, self._set_progress, i)
-                        continue
+                        self.after(0, self._set_progress, i); continue
 
                 if mode == "inplace": target = f
                 else:
@@ -1021,10 +916,9 @@ class App(BaseWindow):
                                     img = background
                                 else: img = img.convert("RGB")
                                 img.save(new_target, "JPEG", quality=100, subsampling=0)
-                            
                             target.unlink(); old_name = target.name; target = new_target
-                            self._log(f"🖼️ Convert to JPEG: {old_name[:30]}... → {target.name}")
-                        except Exception as e: self._log(f"⚠ Gagal Konversi JPEG: {e}")
+                            self._log(f"🖼️ Convert JPEG: {old_name[:30]}... → {target.name}")
+                        except Exception as e: self._log(f"⚠ Gagal JPEG: {e}")
 
                 original_stem = target.stem
                 title = format_text(original_stem, title_fmt)
@@ -1051,7 +945,7 @@ class App(BaseWindow):
                             w, h = img.size; mp = (w * h) / 1_000_000
                             self._log(f"ℹ {target.name}: {w}x{h} ({mp:.1f} MP)")
                             if do_validate_mp and mp < 4.0 and do_upscale_auto:
-                                self._log(f"⚠ Peringatan: {target.name} di bawah 4MP. Auto-Upscale aktif.")
+                                self._log(f"⚠ {target.name} di bawah 4MP. Auto-Upscale aktif.")
                                 need_upscale = True
                     except Exception as e: self._log(f"⚠ Gagal cek resolusi: {e}")
 
@@ -1061,37 +955,46 @@ class App(BaseWindow):
                     if self._upscale_image(target, upscaled, upscale_scale, upscale_model):
                         try:
                             target.unlink(); upscaled.rename(target)
-                            self._log(f"⬆ Upscaled {upscale_scale}x berhasil: {target.name}")
-                        except Exception as e: self._log(f"⚠ Gagal replace upscaled: {e}")
+                            self._log(f"⬆ Upscaled: {target.name}")
+                        except Exception as e: self._log(f"⚠ Gagal replace: {e}")
 
-                # --- NLP ITERATIVE EXPANSION ---
+                # =============== NLP HYBRID =============== #
                 final_kw_list = list(manual_kw_list)
                 
                 if do_nlp and ollama_model:
-                    dynamic_target = TARGET_KEYWORDS
-                    
-                    self.after(0, self._update_status, f"🧠 NLP Base: {target.name[:20]}...")
-                    self._log(f"🧠 [Tahap 1] Ekstrak keyword dasar...")
+                    # TAHAP 1: Base Keywords (Ollama)
+                    self.after(0, self._update_status, f"🧠 Tahap 1 (Ollama): {target.name[:20]}...")
+                    self._log(f"🧠 [Tahap 1] Ekstrak keyword dasar via Ollama...")
                     base_kws = extract_base_keywords(title, ollama_model)
                     
-                    if base_kws:
-                        self._log(f"  ↳ Base keywords: {len(base_kws)}")
+                    seen_kw = set(k.lower().strip() for k in final_kw_list)
+                    for k in base_kws:
+                        if k.lower().strip() not in seen_kw:
+                            final_kw_list.append(k); seen_kw.add(k.lower().strip())
+                    self._log(f"  ↳ Base keywords: {len(final_kw_list)}")
+                    
+                    # TAHAP 2: NLTK Synonyms (INSTAN - OPSIONAL)
+                    if use_nltk and HAS_NLTK and len(final_kw_list) < TARGET_KEYWORDS:
+                        self.after(0, self._update_status, f"🧠 Tahap 2 (NLTK): {target.name[:20]}...")
+                        self._log(f"🧠 [Tahap 2] Mencari sinonim via WordNet...")
                         
-                        combined = list(final_kw_list)
-                        seen = set(k.lower().strip() for k in combined)
-                        for k in base_kws:
-                            if k.lower().strip() not in seen:
-                                combined.append(k)
-                                seen.add(k.lower().strip())
+                        for base_word in base_kws[:10]: # Hanya 10 kata pertama
+                            if len(final_kw_list) >= TARGET_KEYWORDS: break
+                            synonyms = get_nltk_synonyms(base_word, max_per_word=1)
+                            for s in synonyms:
+                                if s.lower() not in seen_kw and len(final_kw_list) < TARGET_KEYWORDS:
+                                    final_kw_list.append(s); seen_kw.add(s.lower())
                         
-                        self.after(0, self._update_status, f"🧠 NLP Expand: {target.name[:20]}...")
-                        self._log(f"🧠 [Tahap 2] Ekspansi iteratif (Target: {dynamic_target})...")
-                        expanded = expand_keywords_iteratively(title, combined, ollama_model, log_callback=self._log, target=dynamic_target)
-                        
+                        self._log(f"  ↳ Setelah NLTK: {len(final_kw_list)} keyword.")
+                    
+                    # TAHAP 3: Ollama Related Concepts
+                    if len(final_kw_list) < TARGET_KEYWORDS:
+                        self.after(0, self._update_status, f"🧠 Tahap 3 (Ollama): {target.name[:20]}...")
+                        self._log(f"🧠 [Tahap 3] Melengkapi konsep terkait via Ollama...")
+                        expanded = expand_keywords_iteratively(title, final_kw_list, ollama_model, log_callback=self._log, target=TARGET_KEYWORDS)
                         final_kw_list = expanded
-                        self._log(f"  ↳ Final: {len(final_kw_list)} keyword dari NLP.")
-                    else:
-                        self._log(f"  ↳ Gagal mendapatkan keyword dasar dari NLP.")
+                    
+                    self._log(f"  ✅ Total Final: {len(final_kw_list)} keyword.")
 
                 final_kw_list = final_kw_list[:TARGET_KEYWORDS]
                 kw_str = ", ".join(final_kw_list)
@@ -1118,20 +1021,17 @@ class App(BaseWindow):
                     with sqlite3.connect(self.db_file) as conn:
                         conn.execute("INSERT OR REPLACE INTO history (original_filename, output_filename) VALUES (?, ?)", (f.name, target.name))
                         conn.commit()
-                except Exception as e: self._log(f"⚠ Gagal simpan ke DB: {e}")
+                except Exception as e: self._log(f"⚠ Gagal simpan DB: {e}")
 
                 self.after(0, self._update_tree_row, f.name, target.name, title, kw_str)
-
                 success += 1
                 results.append({
                     "filename": f.name, "new_filename": target.name, "title": title,
                     "description": description, "keywords": kw_str, "author": author,
                     "category": cat_num or "", "alt": alt, "path": str(target),
                 })
-
             except Exception as e:
                 errors.append(f"{f.name[:30]}: {e}"); self._log(f"✗ {f.name[:30]}: {e}")
-
             self.after(0, self._set_progress, i)
 
         self._last_results = results
@@ -1142,17 +1042,16 @@ class App(BaseWindow):
         self.process_btn.config(state="normal")
         self.progress_label.config(text="Selesai.")
         self._log(f"✔ Selesai. Sukses={success}, Error={len(errors)}")
-        
         if errors:
             play_finish_sound(is_error=True)
-            messagebox.showwarning("Selesai dengan error", f"Sukses: {success}\nGagal: {len(errors)}\n\n5 error pertama:\n" + "\n".join(errors[:5]))
+            messagebox.showwarning("Selesai dengan error", f"Sukses: {success}\nGagal: {len(errors)}\n\n" + "\n".join(errors[:5]))
         else:
             play_finish_sound(is_error=False)
             messagebox.showinfo("Selesai", f"Berhasil memproses {success} file.")
 
     def _export_csv(self):
-        if not self._last_results: messagebox.showinfo("Info", "Belum ada hasil. Jalankan proses dulu."); return
-        path = filedialog.asksaveasfilename(title="Simpan CSV (Adobe Stock)", defaultextension=".csv", filetypes=[("CSV", "*.csv")], initialfile="adobe_stock_metadata.csv")
+        if not self._last_results: messagebox.showinfo("Info", "Belum ada hasil."); return
+        path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV", "*.csv")], initialfile="adobe_stock_metadata.csv")
         if not path: return
         with open(path, "w", newline="", encoding="utf-8-sig") as fp:
             w = csv.DictWriter(fp, fieldnames=["Filename", "Title", "Description", "Keywords", "Category", "Author", "Alt Text"])
@@ -1165,7 +1064,6 @@ class App(BaseWindow):
         messagebox.showinfo("Sukses", f"CSV tersimpan:\n{path}")
 
 
-# ============================================================ #
 if __name__ == "__main__":
     app = App()
     app.mainloop()
