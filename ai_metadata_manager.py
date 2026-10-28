@@ -4,7 +4,7 @@ AI Metadata Manager (Complete & Fixed)
 ======================================
 Batch metadata + rename + duplicate detection (SQLite DB) + drag & drop + dark mode
 + Validasi 4MP, Auto-Upscale (2x/3x/4x), Suara Notifikasi, Simpan Config, 
-+ Auto-Convert JPEG, dan NLP Keyword Generation (Ollama 2-Stage Comma Expansion).
++ Auto-Convert JPEG, dan NLP Keyword Generation (Ollama Iterative Expansion).
 """
 
 import os
@@ -29,6 +29,13 @@ try:
     HAS_OLLAMA = True
 except ImportError:
     HAS_OLLAMA = False
+
+# ---------- Optional: WordNinja for word splitting ---------- #
+try:
+    import wordninja
+    HAS_WORDNINJA = True
+except ImportError:
+    HAS_WORDNINJA = False
 
 # ---------- Sound Notification (Bawaan Windows) ---------- #
 try:
@@ -83,6 +90,19 @@ UPSCALER_MODELS = [
     "realesr-animevideov3",
 ]
 
+TARGET_KEYWORDS = 49
+
+# Blacklist: Kata-kata instruksi yang tidak boleh muncul sebagai keyword
+KEYWORD_BLACKLIST = {
+    "objects", "subjects", "image", "images", "formats", "styles", "aesthetics",
+    "colors", "audience", "visual", "forms", "safe", "diverse", "no", "punctuation",
+    "lowercase", "nsfw", "hate", "speech", "drugs", "inappropriate", "good", "bad",
+    "example", "output", "format", "rule", "rules", "critical", "strict", "task",
+    "generate", "extract", "focus", "include", "must", "only", "word", "words",
+    "keyword", "keywords", "single", "comma", "separated", "list", "json", "quote",
+    "quotes", "bullet", "points", "numbering", "true", "false", "null", "none"
+}
+
 
 # ============================================================ #
 #  NLP FUNCTIONS
@@ -106,63 +126,136 @@ def get_ollama_models() -> list[str]:
         print(f"Gagal mengambil model Ollama: {e}")
         return []
 
+def split_concatenated_word(word: str) -> list[str]:
+    """Memecah kata gabungan seperti 'happykids' menjadi ['happy', 'kids']."""
+    if not HAS_WORDNINJA or len(word) < 8:
+        return [word]
+    try:
+        parts = wordninja.split(word)
+        if len(parts) > 1 and all(len(p) >= 3 for p in parts):
+            return parts
+    except Exception:
+        pass
+    return [word]
+
 def parse_comma_list(raw_text: str) -> list[str]:
-    """Membersihkan output AI dan mengubahnya menjadi list."""
-    # Hapus awalan seperti "Here are the keywords: "
+    """
+    Membersihkan output AI dan membuang kata-kata dari blacklist.
+    """
     if ":" in raw_text:
         raw_text = raw_text.split(":", 1)[1]
+        
+    raw_text = raw_text.replace("'", "").replace('"', "")
+    items = [k.strip() for k in raw_text.split(',') if k.strip()]
     
-    # Pecah berdasarkan koma dan bersihkan
-    keywords = [k.strip().replace('"', '').replace("'", "") for k in raw_text.split(',') if k.strip()]
+    final_keywords = []
+    seen = set()
     
-    # Buang keyword yang terlalu panjang (kemungkinan AI ngelantur)
-    return [k for k in keywords if len(k) < 30]
+    for item in items:
+        # Pisahkan CamelCase
+        item = re.sub(r'(?<!^)(?=[A-Z])', ' ', item)
+        # Ganti hyphen/underscore
+        item = re.sub(r'[-_/]', ' ', item)
+        
+        words = item.split()
+        for w in words:
+            w = w.strip().lower()
+            
+            # Cek Blacklist (buang jika ada di blacklist)
+            if w in KEYWORD_BLACKLIST:
+                continue
+                
+            sub_words = split_concatenated_word(w)
+            for sw in sub_words:
+                if len(sw) > 2 and sw not in seen and sw not in KEYWORD_BLACKLIST:
+                    final_keywords.append(sw)
+                    seen.add(sw)
+                
+    return final_keywords
 
 def extract_base_keywords(title: str, model_name: str) -> list[str]:
-    """Tahap 1: Ambil 10-15 keyword dasar dari judul."""
+    """Tahap 1: Prompt yang sangat sederhana dan langsung pada intinya."""
     prompt = (
-        f"Based on this image title: '{title}', extract 15 core stock photo keywords. "
-        f"CRITICAL RULES: "
-        f"1. DO NOT CONCATENATE WORDS. Use spaces. "
-        f"2. Keep each keyword to 1 or 2 words maximum. "
-        f"3. Output ONLY a comma-separated list of keywords. "
-        f"Example output: apple, red, fruit, healthy, fresh, isolated"
+        f"Image Title: '{title}'\n\n"
+        f"Task: Write 20 single-word keywords for this image. Focus on the actual objects, colors, style, mood, and target audience visible in the title.\n\n"
+        f"Rules:\n"
+        f"- ONLY one word per keyword.\n"
+        f"- NO compound words like 'happykids' or 'minimaliststyle'.\n"
+        f"- Use lowercase letters.\n"
+        f"- Output ONLY a comma-separated list.\n"
+        f"- Do NOT repeat any of these instruction words in your output.\n\n"
+        f"Output:"
     )
     try:
         response = ollama.chat(
             model=model_name,
             messages=[{'role': 'user', 'content': prompt}],
-            options={'think': False, 'num_predict': 150, 'temperature': 0.3}
+            options={'think': False, 'num_predict': 250, 'temperature': 0.3}
         )
         return parse_comma_list(response['message']['content'].strip())
     except Exception as e:
         print(f"Ollama Base Error: {e}")
         return []
 
-def expand_keywords(title: str, base_keywords: list[str], model_name: str) -> list[str]:
-    """Tahap 2: Kembangkan keyword dasar menjadi ~45-50 sinonim & konsep terkait."""
-    base_str = ", ".join(base_keywords)
-    prompt = (
-        f"Image Title: '{title}'\n"
-        f"Base Keywords: {base_str}\n\n"
-        f"Expand these base keywords into a total of 45-50 related stock photo keywords. "
-        f"Include synonyms, colors, textures, moods, and related concepts. "
-        f"CRITICAL RULES: "
-        f"1. DO NOT CONCATENATE WORDS. Use spaces. "
-        f"2. Keep each keyword to 1 or 2 words maximum. "
-        f"3. Output ONLY a comma-separated list of keywords. "
-        f"DO NOT use JSON, brackets, or bullet points."
-    )
-    try:
-        response = ollama.chat(
-            model=model_name,
-            messages=[{'role': 'user', 'content': prompt}],
-            options={'think': False, 'num_predict': 400, 'temperature': 0.4}
+def expand_keywords_iteratively(title: str, existing_kws: list[str], model_name: str, 
+                                 log_callback=None, target: int = TARGET_KEYWORDS, max_iter: int = 5) -> list[str]:
+    """Tahap 2+: Prompt yang sangat sederhana dan langsung pada intinya."""
+    all_kws = list(existing_kws)
+    
+    for iteration in range(1, max_iter + 1):
+        if len(all_kws) >= target:
+            break
+            
+        needed = target - len(all_kws)
+        request_count = min(needed + 5, 25)
+        existing_str = ", ".join(all_kws[-30:])
+        
+        prompt = (
+            f"Image Title: '{title}'\n"
+            f"Existing Keywords: {existing_str}\n\n"
+            f"Task: Write {request_count} NEW single-word keywords for this image.\n\n"
+            f"Rules:\n"
+            f"- ONLY one word per keyword.\n"
+            f"- NO compound words like 'happykids' or 'minimaliststyle'.\n"
+            f"- Do not repeat existing keywords.\n"
+            f"- Output ONLY a comma-separated list.\n"
+            f"- Do NOT repeat any of these instruction words in your output.\n\n"
+            f"Output:"
         )
-        return parse_comma_list(response['message']['content'].strip())
-    except Exception as e:
-        print(f"Ollama Expand Error: {e}")
-        return []
+        
+        try:
+            response = ollama.chat(
+                model=model_name,
+                messages=[{'role': 'user', 'content': prompt}],
+                options={'think': False, 'num_predict': 400, 'temperature': 0.5}
+            )
+            new_kws = parse_comma_list(response['message']['content'].strip())
+            
+            seen = set(k.lower().strip() for k in all_kws)
+            added = 0
+            for k in new_kws:
+                if k.lower() not in seen and k.lower() not in KEYWORD_BLACKLIST:
+                    all_kws.append(k)
+                    seen.add(k.lower())
+                    added += 1
+                            
+            msg = f"  → Iterasi {iteration}: +{added} keyword (total {len(all_kws)})"
+            print(msg)
+            if log_callback: log_callback(msg)
+            
+            if added == 0:
+                msg_stop = "  → AI tidak bisa menambah keyword baru. Berhenti."
+                print(msg_stop)
+                if log_callback: log_callback(msg_stop)
+                break
+                
+        except Exception as e:
+            msg_err = f"Ollama Expand Error pada iterasi {iteration}: {e}"
+            print(msg_err)
+            if log_callback: log_callback(msg_err)
+            break
+    
+    return all_kws[:target]
 
 
 # ============================================================ #
@@ -522,6 +615,14 @@ class App(BaseWindow):
         log_frame.rowconfigure(0, weight=1)
 
         self.log_text = tk.Text(log_frame, wrap="word", font=("Consolas", 9), bg="#1e1e1e", fg="#d4d4d4", insertbackground="white")
+        
+        # Setup warna untuk Log
+        self.log_text.tag_config("success", foreground="#4CAF50") # Hijau
+        self.log_text.tag_config("error", foreground="#F44336")   # Merah
+        self.log_text.tag_config("warning", foreground="#FFC107") # Kuning
+        self.log_text.tag_config("info", foreground="#2196F3")    # Biru
+        self.log_text.tag_config("normal", foreground="#d4d4d4")  # Normal
+
         self.log_text.grid(row=0, column=0, sticky="nsew")
         log_sb = ttkb.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
         log_sb.grid(row=0, column=1, sticky="ns")
@@ -555,12 +656,12 @@ class App(BaseWindow):
         ttkb.Checkbutton(box_res, text="Konversi ke JPEG (Wajib untuk Adobe Stock Ilustrasi)", variable=self.convert_jpeg_var).grid(row=2, column=0, sticky="w", pady=2)
 
         row += 1
-        box_nlp = ttkb.LabelFrame(f, text="NLP Keyword Generation (Ollama 2-Stage Expansion)", padding=10)
+        box_nlp = ttkb.LabelFrame(f, text="NLP Keyword Generation (Ollama Iterative Expansion)", padding=10)
         box_nlp.grid(row=row, column=0, sticky="ew", pady=(0, 10))
         box_nlp.columnconfigure(1, weight=1)
 
         self.nlp_enable_var = tk.BooleanVar(value=True)
-        ttkb.Checkbutton(box_nlp, text="Aktifkan Keyword Expansion via Ollama (Base -> Synonym)", variable=self.nlp_enable_var).grid(row=0, column=0, columnspan=3, sticky="w", pady=2)
+        ttkb.Checkbutton(box_nlp, text="Aktifkan Keyword Expansion via Ollama (Loop hingga 49 keyword)", variable=self.nlp_enable_var).grid(row=0, column=0, columnspan=3, sticky="w", pady=2)
 
         ttkb.Label(box_nlp, text="Ollama Model:").grid(row=1, column=0, sticky="w", pady=2)
         self.ollama_model_var = tk.StringVar(value="")
@@ -685,10 +786,23 @@ class App(BaseWindow):
 
     def _log(self, msg):
         def _append():
-            self.log_text.insert("end", msg + "\n")
+            # Tentukan warna berdasarkan isi pesan
+            tag = "normal"
+            if "✔" in msg or "✅" in msg or "⬆" in msg or "🖼️" in msg or "📝" in msg:
+                tag = "success"
+            elif "✗" in msg or "Error" in msg:
+                tag = "error"
+            elif "⚠" in msg or "Peringatan" in msg:
+                tag = "warning"
+            elif "⏭" in msg or "🔄" in msg or "ℹ" in msg or "▶" in msg or "🧠" in msg or "✅" in msg:
+                tag = "info"
+
+            self.log_text.insert("end", msg + "\n", tag)
             self.log_text.see("end")
             lines = int(self.log_text.index('end-1c').split('.')[0])
-            if lines > 500: self.log_text.delete('1.0', f'{lines-500}.0')
+            # Dibatasi hanya 200 baris terakhir
+            if lines > 200: 
+                self.log_text.delete('1.0', f'{lines-200}.0')
         self.after(0, _append)
 
     def _set_progress(self, value):
@@ -950,45 +1064,36 @@ class App(BaseWindow):
                             self._log(f"⬆ Upscaled {upscale_scale}x berhasil: {target.name}")
                         except Exception as e: self._log(f"⚠ Gagal replace upscaled: {e}")
 
-                # --- NLP 2-STAGE EXPANSION ---
+                # --- NLP ITERATIVE EXPANSION ---
                 final_kw_list = list(manual_kw_list)
                 
                 if do_nlp and ollama_model:
-                    # Tahap 1: Ambil Base
+                    dynamic_target = TARGET_KEYWORDS
+                    
                     self.after(0, self._update_status, f"🧠 NLP Base: {target.name[:20]}...")
                     self._log(f"🧠 [Tahap 1] Ekstrak keyword dasar...")
                     base_kws = extract_base_keywords(title, ollama_model)
                     
                     if base_kws:
-                        self._log(f"  ↳ Dapat {len(base_kws)} base keyword.")
+                        self._log(f"  ↳ Base keywords: {len(base_kws)}")
                         
-                        # Tahap 2: Expand
+                        combined = list(final_kw_list)
+                        seen = set(k.lower().strip() for k in combined)
+                        for k in base_kws:
+                            if k.lower().strip() not in seen:
+                                combined.append(k)
+                                seen.add(k.lower().strip())
+                        
                         self.after(0, self._update_status, f"🧠 NLP Expand: {target.name[:20]}...")
-                        self._log(f"🧠 [Tahap 2] Ekspansi sinonim & konsep...")
-                        expand_kws = expand_keywords(title, base_kws, ollama_model)
+                        self._log(f"🧠 [Tahap 2] Ekspansi iteratif (Target: {dynamic_target})...")
+                        expanded = expand_keywords_iteratively(title, combined, ollama_model, log_callback=self._log, target=dynamic_target)
                         
-                        # Gabungkan hasil base & expand
-                        all_nlp_kws = base_kws + expand_kws
-                        
-                        seen_kw = set(k.lower() for k in final_kw_list)
-                        added_count = 0
-                        for k in all_nlp_kws:
-                            k_clean = k.strip()
-                            k_clean = re.sub(r'(?<!^)(?=[A-Z])', ' ', k_clean)
-                            parts = k_clean.split()
-                            
-                            if len(parts) <= 2:
-                                if k_clean.lower() not in seen_kw:
-                                    final_kw_list.append(k_clean); seen_kw.add(k_clean.lower()); added_count += 1
-                            else:
-                                for part in parts:
-                                    if part.lower() not in seen_kw:
-                                        final_kw_list.append(part); seen_kw.add(part.lower()); added_count += 1
-                        self._log(f"  ↳ Total {added_count} keyword baru ditambahkan (Expanded).")
+                        final_kw_list = expanded
+                        self._log(f"  ↳ Final: {len(final_kw_list)} keyword dari NLP.")
                     else:
                         self._log(f"  ↳ Gagal mendapatkan keyword dasar dari NLP.")
 
-                final_kw_list = final_kw_list[:50]
+                final_kw_list = final_kw_list[:TARGET_KEYWORDS]
                 kw_str = ", ".join(final_kw_list)
 
                 exe = get_exiftool_path()
