@@ -100,7 +100,7 @@ ADOBE_CATEGORIES = [
 UPSCALER_MODELS = ["realesrgan-x4plus", "realesrgan-x4plus-anime", "realesr-animevideov3"]
 
 TARGET_KEYWORDS = 49
-DEFAULT_MAX_LENGTH = 200  # Adobe Stock: 200 chars (but we go to <200 => max 199)
+DEFAULT_MAX_LENGTH = 196
 
 ORGANIZE_MODES = [
     ("None (Flat)", "none"),
@@ -126,7 +126,7 @@ KEYWORD_BLACKLIST = {
     "pawpaw", "papaia", "ananas", "medallion", "yellowness",
 
     # --- Merek Dagang & Produk ---
-    "absolut", "absolut vodka", "adidas", "airstream", "band-aid",
+    "absolut", "absolut vodka", "adidas", "airstream", "apple", "band-aid",
     "barbie", "build-a-bear", "build-a-bear workshop", "canon", "cia",
     "disney", "ferrari", "google", "ipad", "iphone", "iphone 15", "jacuzzi",
     "jeep", "lego", "macbook", "marvel", "mattel", "mickey", "mickey mouse",
@@ -167,20 +167,25 @@ KEYWORD_BLACKLIST = {
     "machu picchu"
 }
 
+# Kata-kata yang DILARANG dipecah oleh wordninja
+NO_SPLIT_WORDS = {
+    "pixelated", "background", "composition", "illustration", "minimalist",
+    "colorful", "isolated", "seamless", "template", "brochure", "presentation",
+    "childrens", "graphics", "abstract", "vibrant", "peaceful", "beautiful",
+    "digital", "artwork", "pattern", "patterns", "vector", "vectors",
+    "realistic", "landscape", "portrait", "texture", "textures", "creative",
+    "elephant", "elephants", "butterfly", "butterflies", "stunning",
+    "adventure", "business", "corporate", "education", "technology",
+    "celebration", "decoration", "inspiration", "motivation", "generative"
+}
+
 
 # ============================================================ #
-#  TEXT TRUNCATION (REMOVE WORDS FROM END, HARD LIMIT = max_len - 1)
+#  TEXT TRUNCATION
 # ============================================================ #
 def truncate_text_smart(text: str, max_len: int = DEFAULT_MAX_LENGTH) -> str:
-    """
-    Hapus kata dari belakang satu per satu hingga panjang <= max_len - 1.
-    Suffix (N) dianggap kata biasa dan bisa dihapus jika diperlukan.
-    """
     text = re.sub(r"\s+", " ", text).strip()
-    
-    # Batas keras: max_len - 1 (agar hasilnya strictly < max_len)
     hard_limit = max_len - 1
-    
     if len(text) <= hard_limit:
         return text
     
@@ -188,12 +193,10 @@ def truncate_text_smart(text: str, max_len: int = DEFAULT_MAX_LENGTH) -> str:
     while len(body) > hard_limit:
         last_space = body.rfind(" ")
         if last_space == -1:
-            # Tidak ada spasi -> potong paksa (jarang terjadi)
             body = body[:hard_limit]
             break
         body = body[:last_space].rstrip()
     
-    # Bersihkan tanda baca & spasi di akhir
     body = re.sub(r"[\s,;:\-—–\.]+$", "", body).strip()
     return body
 
@@ -219,6 +222,8 @@ def get_ollama_models() -> list[str]:
 
 def split_concatenated_word(word: str) -> list[str]:
     if not HAS_WORDNINJA or len(word) < 8: return [word]
+    # Whitelist: Jangan pecah kata-kata ini
+    if word.lower() in NO_SPLIT_WORDS: return [word]
     try:
         parts = wordninja.split(word)
         if len(parts) > 1 and all(len(p) >= 3 for p in parts): return parts
