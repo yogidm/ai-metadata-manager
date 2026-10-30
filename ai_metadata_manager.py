@@ -5,7 +5,7 @@ AI Metadata Manager (Complete & Fixed)
 Batch metadata + rename + duplicate detection (SQLite DB) + drag & drop + dark mode
 + Validasi 4MP, Auto-Upscale (2x/3x/4x), Suara Notifikasi, Simpan Config, 
 + Auto-Convert JPEG, NLP Keyword Generation (Ollama + Optional NLTK),
-+ dan Organize Subfolder untuk portofolio besar.
++ Organize Subfolder, Smart Word Truncate, dan Sanitizer.
 """
 
 import os
@@ -100,6 +100,7 @@ ADOBE_CATEGORIES = [
 UPSCALER_MODELS = ["realesrgan-x4plus", "realesrgan-x4plus-anime", "realesr-animevideov3"]
 
 TARGET_KEYWORDS = 49
+DEFAULT_MAX_LENGTH = 200  # Adobe Stock: 200 chars (but we go to <200 => max 199)
 
 ORGANIZE_MODES = [
     ("None (Flat)", "none"),
@@ -111,6 +112,7 @@ ORGANIZE_MODES = [
 ]
 
 KEYWORD_BLACKLIST = {
+    # --- Istilah Meta & Umum ---
     "objects", "subjects", "image", "images", "formats", "styles", "aesthetics",
     "colors", "audience", "visual", "forms", "safe", "diverse", "no", "punctuation",
     "lowercase", "nsfw", "hate", "speech", "drugs", "inappropriate", "good", "bad",
@@ -121,8 +123,79 @@ KEYWORD_BLACKLIST = {
     "type", "types", "content", "concept", "concepts", "noun", "nouns", "adjective",
     "chickenhearted", "xanthous", "viridity", "orangeness", "unseamed",
     "nestling", "transmitter", "iterate", "restate", "flatbed", "unconditional",
-    "pawpaw", "papaia", "ananas", "medallion", "yellowness"
+    "pawpaw", "papaia", "ananas", "medallion", "yellowness",
+
+    # --- Merek Dagang & Produk ---
+    "absolut", "absolut vodka", "adidas", "airstream", "band-aid",
+    "barbie", "build-a-bear", "build-a-bear workshop", "canon", "cia",
+    "disney", "ferrari", "google", "ipad", "iphone", "iphone 15", "jacuzzi",
+    "jeep", "lego", "macbook", "marvel", "mattel", "mickey", "mickey mouse",
+    "nike", "nikon", "oscar", "pernod ricard", "photoshop", "porsche",
+    "sam houston", "sony", "swiss re building", "tesla", "the gherkin",
+    "velcro", "android",
+
+    # --- Nama Artis, Selebriti & Tokoh Fiksi ---
+    "albert einstein", "ansel adams", "banksy", "batman", "byeol kim",
+    "chihuly", "daenerys targaryen", "dale chihuly", "doina ciobanu",
+    "einstein", "emily johnson", "frank gehry", "gandalf", "gaultier de chiel",
+    "harold thomas", "ishikawa yuki", "joy ang", "monalisa", "obama",
+    "picasso", "pikachu", "spider-man", "van gogh", "yayoi kusama",
+
+    # --- Lembaga Pemerintah & Acara Berita ---
+    "fbi", "nasa", "nsa", "dhs", "ice", "election", "protest", "war",
+    "crisis", "conflict", "invasion", "riot", "demonstration", "coup",
+    "pandemic", "outbreak", "refugee", "sanction", "summit", "treaty",
+
+    # --- Karya Berhak Cipta & Referensi Gaya ---
+    "in the style of", "inspired by", "influenced by", "harry potter", "star wars",
+    "hello kitty", "pokemon", "nintendo", "studio ghibli", "game of thrones",
+
+    # --- Spesifikasi Teknis & Model Kamera ---
+    "12mp", "24mp", "50mm", "85mm", "f/1.8", "f/2.8", "iso", "jpeg", "raw",
+    "leica", "hasselblad", "dji", "gopro", "camera", "lens", "aperture",
+    "shutter speed", "full frame", "bokeh", "vector", "3d render",
+
+    # --- Bahasa Promosi & Subjektif ---
+    "amazing", "stunning", "best", "beautiful", "perfect", "incredible",
+    "awesome", "fantastic", "excellent", "superb", "gorgeous", "breathtaking",
+    "must-have", "ideal for", "perfect for",
+
+    # --- Nama Tempat yang Tidak Terlihat / Dibatasi ---
+    "bacc... ", "brussels", "dubai", "huntsville", "london", "manama",
+    "new york", "siena", "tuscany", "washington d.c.", "paris",
+    "eiffel tower", "colosseum", "taj mahal", "great wall of china",
+    "machu picchu"
 }
+
+
+# ============================================================ #
+#  TEXT TRUNCATION (REMOVE WORDS FROM END, HARD LIMIT = max_len - 1)
+# ============================================================ #
+def truncate_text_smart(text: str, max_len: int = DEFAULT_MAX_LENGTH) -> str:
+    """
+    Hapus kata dari belakang satu per satu hingga panjang <= max_len - 1.
+    Suffix (N) dianggap kata biasa dan bisa dihapus jika diperlukan.
+    """
+    text = re.sub(r"\s+", " ", text).strip()
+    
+    # Batas keras: max_len - 1 (agar hasilnya strictly < max_len)
+    hard_limit = max_len - 1
+    
+    if len(text) <= hard_limit:
+        return text
+    
+    body = text
+    while len(body) > hard_limit:
+        last_space = body.rfind(" ")
+        if last_space == -1:
+            # Tidak ada spasi -> potong paksa (jarang terjadi)
+            body = body[:hard_limit]
+            break
+        body = body[:last_space].rstrip()
+    
+    # Bersihkan tanda baca & spasi di akhir
+    body = re.sub(r"[\s,;:\-—–\.]+$", "", body).strip()
+    return body
 
 
 # ============================================================ #
@@ -422,6 +495,7 @@ class App(BaseWindow):
                 self.output_var.set(data.get("output_folder", ""))
                 self.ollama_model_var.set(data.get("ollama_model", ""))
                 self.organize_mode_var.set(data.get("organize_mode", "batch_100"))
+                self.max_length_var.set(data.get("max_length", DEFAULT_MAX_LENGTH))
                 saved_upscaler = data.get("upscaler_path", "")
                 if saved_upscaler and Path(saved_upscaler).exists():
                     self.upscaler_path_var.set(saved_upscaler)
@@ -435,6 +509,7 @@ class App(BaseWindow):
                 "upscaler_path": self.upscaler_path_var.get().strip(),
                 "ollama_model": self.ollama_model_var.get().strip(),
                 "organize_mode": self.organize_mode_var.get(),
+                "max_length": self.max_length_var.get(),
             }
             with open(self.config_file, "w", encoding="utf-8") as f: json.dump(data, f, indent=4)
         except Exception as e: self._log(f"⚠ Gagal simpan config: {e}")
@@ -491,7 +566,7 @@ class App(BaseWindow):
 
         row += 1
         ttkb.Label(f, text="Author / Creator:").grid(row=row, column=0, sticky="w", pady=4)
-        self.author_var = tk.StringVar(value="AI Generated")
+        self.author_var = tk.StringVar(value="demhnd")
         ttkb.Entry(f, textvariable=self.author_var).grid(row=row, column=1, sticky="ew", padx=6, columnspan=2)
 
         row += 1
@@ -573,6 +648,15 @@ class App(BaseWindow):
         ttkb.Checkbutton(box_res, text="Konversi ke JPEG", variable=self.convert_jpeg_var).grid(row=2, column=0, sticky="w", pady=2)
 
         row += 1
+        box_txt = ttkb.LabelFrame(f, text="✂️ Text Length (Adobe Stock Limit)", padding=10)
+        box_txt.grid(row=row, column=0, sticky="ew", pady=(0, 10)); box_txt.columnconfigure(1, weight=1)
+        ttkb.Label(box_txt, text="Max Title & Description Length:").grid(row=0, column=0, sticky="w", pady=2)
+        self.max_length_var = tk.IntVar(value=DEFAULT_MAX_LENGTH)
+        ttkb.Spinbox(box_txt, from_=50, to=500, textvariable=self.max_length_var, width=10).grid(row=0, column=1, sticky="w", padx=6)
+        ttkb.Label(box_txt, text="(Hapus kata dari belakang hingga < max. Suffix (N) ikut dihapus jika perlu.)",
+                   foreground="#888", wraplength=600).grid(row=1, column=0, columnspan=2, sticky="w", padx=2, pady=4)
+
+        row += 1
         box_nlp = ttkb.LabelFrame(f, text="NLP Keyword Generation", padding=10)
         box_nlp.grid(row=row, column=0, sticky="ew", pady=(0, 10)); box_nlp.columnconfigure(1, weight=1)
         self.nlp_enable_var = tk.BooleanVar(value=True)
@@ -603,7 +687,7 @@ class App(BaseWindow):
             self.organize_mode_var.set(mode_values.get(self.organize_combo.get(), "none"))
         self.organize_combo.bind("<<ComboboxSelected>>", on_org_change)
         
-        ttkb.Label(box_org, text="File 1-100 → folder '100/', file 101-200 → folder '200/', dst.\nMemudahkan navigasi saat portofolio sudah sangat besar.",
+        ttkb.Label(box_org, text="File 1-100 → folder '100/', file 101-200 → folder '200/', dst.",
                    foreground="#888").grid(row=1, column=0, columnspan=2, sticky="w", padx=2, pady=4)
 
         row += 1
@@ -703,7 +787,7 @@ class App(BaseWindow):
     def _log(self, msg):
         def _append():
             tag = "normal"
-            if "✔" in msg or "✅" in msg or "⬆" in msg or "🖼️" in msg or "📝" in msg or "📁" in msg: tag = "success"
+            if "✔" in msg or "✅" in msg or "⬆" in msg or "🖼️" in msg or "📝" in msg or "📁" in msg or "✂️" in msg: tag = "success"
             elif "✗" in msg or "Error" in msg: tag = "error"
             elif "⚠" in msg: tag = "warning"
             elif "⏭" in msg or "🔄" in msg or "ℹ" in msg or "▶" in msg or "🧠" in msg: tag = "info"
@@ -833,6 +917,7 @@ class App(BaseWindow):
         rename_pattern = self.rename_pattern_var.get().strip()
         start_num = self.start_num_var.get()
         organize_mode = self.organize_mode_var.get()
+        max_length = self.max_length_var.get()
 
         db_history = {}
         if do_dup:
@@ -917,17 +1002,24 @@ class App(BaseWindow):
 
                 original_stem = target.stem
                 
-                # --- SANITIZE TEXT (Hapus ? ! dan em-dash —) ---
+                # Sanitize
                 clean_stem = re.sub(r'[?!—–]', ' ', original_stem)
                 clean_stem = re.sub(r'\s+', ' ', clean_stem).strip()
                 
-                title = format_text(clean_stem, title_fmt)
-                # Perbaiki Children'S -> Children's SETELAH di-title-case
-                title = re.sub(r"'S\b", "'s", title)
-                title = re.sub(r"\s+", " ", title).strip()
-
+                # Title + Smart Truncate (hapus per kata, termasuk suffix (N))
+                raw_title = format_text(clean_stem, title_fmt)
+                raw_title = re.sub(r"'S\b", "'s", raw_title)
+                title = truncate_text_smart(raw_title, max_len=max_length)
+                if len(raw_title) > len(title):
+                    self._log(f"✂️ Title: {len(raw_title)} → {len(title)} karakter")
+                
+                # Description + Smart Truncate
                 desc_text = re.sub(r"[_\-—–]+", " ", clean_stem)
-                description = re.sub(r"\s+", " ", desc_text).strip()
+                desc_text = re.sub(r"\s+", " ", desc_text).strip()
+                description = truncate_text_smart(desc_text, max_len=max_length)
+                if len(desc_text) > len(description):
+                    self._log(f"✂️ Description: {len(desc_text)} → {len(description)} karakter")
+                
                 alt = alt_text or title
 
                 if do_rename:
