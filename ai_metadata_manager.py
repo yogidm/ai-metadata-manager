@@ -101,7 +101,6 @@ UPSCALER_MODELS = ["realesrgan-x4plus", "realesrgan-x4plus-anime", "realesr-anim
 
 TARGET_KEYWORDS = 49
 
-# Organize modes: display label -> internal value
 ORGANIZE_MODES = [
     ("None (Flat)", "none"),
     ("Batch of 100 (100, 200, 300...)", "batch_100"),
@@ -130,8 +129,7 @@ KEYWORD_BLACKLIST = {
 #  NLP FUNCTIONS
 # ============================================================ #
 def get_ollama_models() -> list[str]:
-    if not HAS_OLLAMA:
-        return []
+    if not HAS_OLLAMA: return []
     try:
         response = ollama.list()
         models = []
@@ -144,23 +142,18 @@ def get_ollama_models() -> list[str]:
                 name = m.model if hasattr(m, 'model') else m.name
                 if name: models.append(name)
         return sorted(list(set(models)))
-    except Exception:
-        return []
+    except Exception: return []
 
 def split_concatenated_word(word: str) -> list[str]:
-    if not HAS_WORDNINJA or len(word) < 8:
-        return [word]
+    if not HAS_WORDNINJA or len(word) < 8: return [word]
     try:
         parts = wordninja.split(word)
-        if len(parts) > 1 and all(len(p) >= 3 for p in parts):
-            return parts
-    except Exception:
-        pass
+        if len(parts) > 1 and all(len(p) >= 3 for p in parts): return parts
+    except Exception: pass
     return [word]
 
 def parse_comma_list(raw_text: str) -> list[str]:
-    if ":" in raw_text:
-        raw_text = raw_text.split(":", 1)[1]
+    if ":" in raw_text: raw_text = raw_text.split(":", 1)[1]
     raw_text = raw_text.replace("'", "").replace('"', "")
     items = [k.strip() for k in raw_text.split(',') if k.strip()]
     final_keywords = []
@@ -198,8 +191,7 @@ def extract_base_keywords(title: str, model_name: str) -> list[str]:
         f"- Use lowercase letters.\n- Output ONLY a comma-separated list.\n\nOutput:"
     )
     try:
-        r = ollama.chat(model=model_name, messages=[{'role': 'user', 'content': prompt}],
-                        options={'think': False, 'num_predict': 250, 'temperature': 0.3})
+        r = ollama.chat(model=model_name, messages=[{'role': 'user', 'content': prompt}], options={'think': False, 'num_predict': 250, 'temperature': 0.3})
         return parse_comma_list(r['message']['content'].strip())
     except Exception: return []
 
@@ -217,8 +209,7 @@ def expand_keywords_iteratively(title: str, existing_kws: list[str], model_name:
             f"Rules:\n- ONLY one word per keyword.\n- Do not repeat existing.\n- Output ONLY comma-separated.\n\nOutput:"
         )
         try:
-            r = ollama.chat(model=model_name, messages=[{'role': 'user', 'content': prompt}],
-                            options={'think': False, 'num_predict': 400, 'temperature': 0.6})
+            r = ollama.chat(model=model_name, messages=[{'role': 'user', 'content': prompt}], options={'think': False, 'num_predict': 400, 'temperature': 0.6})
             new_kws = parse_comma_list(r['message']['content'].strip())
             seen = set(k.lower().strip() for k in all_kws)
             added = 0
@@ -339,19 +330,15 @@ def find_upscaler():
     return None
 
 def get_organize_subfolder(mode: str, file_id: int = None) -> Path:
-    """Returns the subfolder path based on organize mode."""
-    if mode == "none":
-        return Path(".")
+    if mode == "none": return Path(".")
     if mode.startswith("batch_"):
         chunk = int(mode.split("_")[1])
         if file_id is not None:
             folder_num = ((file_id - 1) // chunk) * chunk + chunk
             return Path(str(folder_num))
         return Path(datetime.datetime.now().strftime("%Y-%m"))
-    if mode == "monthly":
-        return Path(datetime.datetime.now().strftime("%Y-%m"))
-    if mode == "daily":
-        return Path(datetime.datetime.now().strftime("%Y-%m-%d"))
+    if mode == "monthly": return Path(datetime.datetime.now().strftime("%Y-%m"))
+    if mode == "daily": return Path(datetime.datetime.now().strftime("%Y-%m-%d"))
     return Path(".")
 
 
@@ -847,7 +834,6 @@ class App(BaseWindow):
         start_num = self.start_num_var.get()
         organize_mode = self.organize_mode_var.get()
 
-        # Load DB history
         db_history = {}
         if do_dup:
             self._log("🔎 Memuat riwayat DB...")
@@ -859,7 +845,6 @@ class App(BaseWindow):
             except Exception as e: self._log(f"⚠ Gagal load DB: {e}")
             self._log(f"✅ Memuat {len(db_history)} riwayat.")
 
-        # Pre-scan output files (cache filenames for fast lookup)
         existing_files = set()
         if do_dup and out_dir and out_dir.exists():
             self._log("🔎 Memindai file di folder output...")
@@ -882,7 +867,6 @@ class App(BaseWindow):
             try:
                 self.after(0, self._update_status, f"Memproses ({i}/{len(files)}): {f.name[:30]}...")
                 
-                # Duplicate check (against DB + existing files on disk)
                 if do_dup and f.name in db_history:
                     expected_out_name = db_history[f.name]
                     if expected_out_name in existing_files:
@@ -891,7 +875,6 @@ class App(BaseWindow):
                         self.after(0, self._set_progress, i)
                         continue
 
-                # Copy/Move to output (root first)
                 if mode == "inplace": target = f
                 else:
                     try: rel = f.parent.relative_to(in_dir)
@@ -901,7 +884,6 @@ class App(BaseWindow):
                     if mode == "copy": shutil.copy2(f, target)
                     elif mode == "move": shutil.move(f, target)
 
-                # Fix Extension
                 real_ext = None
                 try:
                     with open(target, "rb") as fp:
@@ -918,7 +900,6 @@ class App(BaseWindow):
                     self._log(f"🔄 Fix Ekstensi: {target.name[:30]}... → {new_target.name[:30]}...")
                     target = new_target
 
-                # Convert to JPEG
                 if do_convert_jpeg and target.suffix.lower() not in (".jpg", ".jpeg"):
                     if HAS_PIL:
                         try:
@@ -926,7 +907,7 @@ class App(BaseWindow):
                             with Image.open(target) as img:
                                 if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
                                     bg = Image.new("RGB", img.size, (255, 255, 255))
-                                    bg.paste(img, mask=img.split()[-1])
+                                    bg.paste(img, mask=img.split()[-1]) 
                                     img = bg
                                 else: img = img.convert("RGB")
                                 img.save(new_target, "JPEG", quality=100, subsampling=0)
@@ -935,12 +916,20 @@ class App(BaseWindow):
                         except Exception as e: self._log(f"⚠ Gagal JPEG: {e}")
 
                 original_stem = target.stem
-                title = format_text(original_stem, title_fmt)
-                desc_text = re.sub(r"[_\-]+", " ", original_stem)
+                
+                # --- SANITIZE TEXT (Hapus ? ! dan em-dash —) ---
+                clean_stem = re.sub(r'[?!—–]', ' ', original_stem)
+                clean_stem = re.sub(r'\s+', ' ', clean_stem).strip()
+                
+                title = format_text(clean_stem, title_fmt)
+                # Perbaiki Children'S -> Children's SETELAH di-title-case
+                title = re.sub(r"'S\b", "'s", title)
+                title = re.sub(r"\s+", " ", title).strip()
+
+                desc_text = re.sub(r"[_\-—–]+", " ", clean_stem)
                 description = re.sub(r"\s+", " ", desc_text).strip()
                 alt = alt_text or title
 
-                # Rename + Organize Subfolder
                 if do_rename:
                     final_id = next_num
                     for _guard in range(10000):
@@ -965,7 +954,6 @@ class App(BaseWindow):
                         target = new_path
                     next_num = final_id + 1
 
-                # Upscale
                 need_upscale = do_upscale_force
                 if HAS_PIL:
                     try:
@@ -986,7 +974,6 @@ class App(BaseWindow):
                             self._log(f"⬆ Upscaled: {target.name}")
                         except Exception as e: self._log(f"⚠ Gagal replace: {e}")
 
-                # NLP Hybrid
                 final_kw_list = list(manual_kw_list)
                 if do_nlp and ollama_model:
                     self.after(0, self._update_status, f"🧠 NLP Ollama: {target.name[:20]}...")
@@ -1018,7 +1005,6 @@ class App(BaseWindow):
                 final_kw_list = final_kw_list[:TARGET_KEYWORDS]
                 kw_str = ", ".join(final_kw_list)
 
-                # Write Metadata
                 exe = get_exiftool_path()
                 cmd = [exe, "-charset", "utf8", "-overwrite_original", "-m", "-sep", ", "]
                 cmd += ["-Keywords=", "-Subject=", "-IPTC:Keywords=", "-XMP-dc:Subject="]
@@ -1037,7 +1023,6 @@ class App(BaseWindow):
                 r = subprocess.run(cmd, capture_output=True, text=True, creationflags=flags)
                 if r.returncode != 0: raise RuntimeError((r.stderr or r.stdout).strip())
 
-                # Save DB (with output_path)
                 try:
                     rel_path = str(target.relative_to(out_dir)) if mode != "inplace" else ""
                     with sqlite3.connect(self.db_file) as conn:
